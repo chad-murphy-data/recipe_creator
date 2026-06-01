@@ -15,7 +15,8 @@ Per request the app runs this pipeline:
 2. **Grounding** (code) sends those ingredients to a Supabase edge function that
    queries USDA, verifies each hit actually contains the `match` term (so edamame
    can't silently resolve to asparagus), and returns each ingredient's per-100g
-   macros.
+   macros. Charlie's staple foods (`src/staples.js`) resolve to a pinned USDA
+   entry, so common ingredients skip the fuzzy search and use a known-good ID.
 3. **Solve** (code, `src/solver.js`): the precision engine. Macros are linear in
    grams, so hitting the targets is a small bounded least-squares solve on the
    per-100g vectors. Code computes the exact gram weights, within sane per-role

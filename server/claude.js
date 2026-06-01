@@ -9,7 +9,9 @@
 //     side. Model and token cap are fixed here so the endpoint can't be reused
 //     as an open-ended relay.
 const MODEL = "claude-sonnet-4-6";
-const MAX_TOKENS = 1000;
+// Recipes with many ingredients (each now carrying name/usdaQuery/match/role)
+// plus steps can exceed 1000 tokens; a truncated response breaks JSON.parse.
+const MAX_TOKENS = 2000;
 const ANTHROPIC_VERSION = "2023-06-01";
 
 export async function handleClaudeRequest(body, password, env) {
@@ -46,5 +48,15 @@ async function callAnthropic(body, apiKey) {
   });
 
   const data = await resp.json();
+
+  // If the model hit the token ceiling, the JSON is truncated. Fail with a clear
+  // message rather than handing the client a half-object that breaks JSON.parse.
+  if (resp.ok && data?.stop_reason === "max_tokens") {
+    return {
+      status: 502,
+      data: { error: { message: "The recipe was too long and got cut off (hit the token limit). Try again or simplify the request." } },
+    };
+  }
+
   return { status: resp.status, data };
 }

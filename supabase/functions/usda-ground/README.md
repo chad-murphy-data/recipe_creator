@@ -9,9 +9,12 @@ directly to Supabase; keep this file in sync with the deployed version.
 
 ## Matching
 
-- Searches the detailed `usdaQuery` first, then falls back to the bare `match`
-  noun if the food doesn't surface (a noisy query like "shelled edamame cooked"
-  buries the real entry under generic "cooked" vegetables).
+- If the caller passes a pinned `fdcId` (a curated staple from `src/staples.js`),
+  the function fetches that exact entry and skips search entirely. This removes
+  search variance for Charlie's regulars.
+- Otherwise it searches the detailed `usdaQuery` first, then falls back to the
+  bare `match` noun if the food doesn't surface (a noisy query like "shelled
+  edamame cooked" buries the real entry under generic "cooked" vegetables).
 - Requires the chosen entry's description to contain the `match` term, prefers a
   cooked/prepared form, and avoids raw. Fails loudly (naming the ingredient)
   rather than substituting a wrong food.

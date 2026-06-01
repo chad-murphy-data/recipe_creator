@@ -70,21 +70,30 @@ Deno.serve(async (req: Request) => {
     const grounded: any[] = [];
     const total = { kcal:0, protein:0, fat:0, carbs:0, fiber:0 };
     for (const ing of ingredients) {
-      // 1) Try the generator's detailed cooked-targeted query (precise variant).
-      let hits = await search(ing.usdaQuery);
-      let chosen = selectHit(hits, ing.match);
-      // 2) Fallback: search the bare food noun. A noisy query like
-      //    "shelled edamame cooked" floods results with "cooked" vegetables and
-      //    buries the real "Edamame" entry; "edamame" alone finds it.
-      if (!chosen && ing.match && ing.match.trim().toLowerCase() !== (ing.usdaQuery ?? "").trim().toLowerCase()) {
-        hits = await search(ing.match);
+      let chosen: any;
+      if (ing.fdcId) {
+        // 0) Pinned staple: fetch the exact curated entry, no search. The macros
+        //    fetch carries the description, so we trust the caller's pin.
+        chosen = { fdcId: ing.fdcId, description: null };
+      } else {
+        // 1) Try the generator's detailed cooked-targeted query (precise variant).
+        let hits = await search(ing.usdaQuery);
         chosen = selectHit(hits, ing.match);
-      }
-      if (!chosen) {
-        const seen = hits.slice(0, 3).map((h: any) => h.description).join(" | ");
-        throw new Error(`No USDA entry matching "${ing.match ?? ing.usdaQuery}" for "${ing.name}". Top hits were: ${seen}`);
+        // 2) Fallback: search the bare food noun. A noisy query like
+        //    "shelled edamame cooked" floods results with "cooked" vegetables and
+        //    buries the real "Edamame" entry; "edamame" alone finds it.
+        if (!chosen && ing.match && ing.match.trim().toLowerCase() !== (ing.usdaQuery ?? "").trim().toLowerCase()) {
+          hits = await search(ing.match);
+          chosen = selectHit(hits, ing.match);
+        }
+        if (!chosen) {
+          const seen = hits.slice(0, 3).map((h: any) => h.description).join(" | ");
+          throw new Error(`No USDA entry matching "${ing.match ?? ing.usdaQuery}" for "${ing.name}". Top hits were: ${seen}`);
+        }
       }
       const per100 = await macros(chosen.fdcId);
+      // For pinned entries, fill the description from the fetched food.
+      if (!chosen.description) chosen.description = per100.description;
       const f = (ing.grams ?? 0) / 100;
       const contributes = {
         kcal: per100.kcal * f, protein: per100.protein * f, fat: per100.fat * f,
