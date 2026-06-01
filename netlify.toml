@@ -5,11 +5,17 @@
 [functions]
   directory = "netlify/functions"
 
-# Route the browser's /api/claude to the serverless proxy.
-# This must come before the SPA fallback below.
+# Route the browser's /api/* to the serverless functions.
+# These must come before the SPA fallback below.
 [[redirects]]
   from = "/api/claude"
   to = "/.netlify/functions/claude"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/recipes"
+  to = "/.netlify/functions/recipes"
   status = 200
   force = true
 

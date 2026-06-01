@@ -1,27 +1,47 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
-import { handleClaudeRequest } from "./server/claude.js";
+import { handleClaudeRequest, checkPassword } from "./server/claude.js";
+import { handleRecipes } from "./server/recipes.js";
 
-// Dev-only middleware so `npm run dev` serves the same /api/claude endpoint that
-// the Netlify function serves in production: password check plus Anthropic proxy,
-// both reading server-side env vars (no VITE_ prefix, so never bundled to the client).
+// Dev-only middleware so `npm run dev` serves the same /api/* endpoints the
+// Netlify functions serve in production: password check, Anthropic proxy, and
+// server-side recipes access. All read server-side env vars (no VITE_ prefix,
+// so never bundled to the client).
 function apiDevProxy(env) {
   return {
     name: "api-dev-proxy",
     configureServer(server) {
-      server.middlewares.use("/api/claude", async (req, res) => {
-        const send = (obj, status) => {
-          res.statusCode = status;
-          res.setHeader("content-type", "application/json");
-          res.end(JSON.stringify(obj));
-        };
-        if (req.method !== "POST") return send({ error: { message: "Method not allowed" } }, 405);
+      const readBody = async (req) => {
+        let raw = "";
+        for await (const chunk of req) raw += chunk;
+        return JSON.parse(raw || "{}");
+      };
+      const sender = (res) => (obj, status) => {
+        res.statusCode = status;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(obj));
+      };
 
+      server.middlewares.use("/api/claude", async (req, res) => {
+        const send = sender(res);
+        if (req.method !== "POST") return send({ error: { message: "Method not allowed" } }, 405);
         const password = req.headers["x-app-password"] || "";
         try {
-          let raw = "";
-          for await (const chunk of req) raw += chunk;
-          const { status, data } = await handleClaudeRequest(JSON.parse(raw || "{}"), password, env);
+          const { status, data } = await handleClaudeRequest(await readBody(req), password, env);
+          send(data, status);
+        } catch (e) {
+          send({ error: { message: String(e?.message ?? e) } }, 502);
+        }
+      });
+
+      server.middlewares.use("/api/recipes", async (req, res) => {
+        const send = sender(res);
+        if (req.method !== "POST") return send({ error: { message: "Method not allowed" } }, 405);
+        const password = req.headers["x-app-password"] || "";
+        const denied = checkPassword(password, env);
+        if (denied) return send(denied.data, denied.status);
+        try {
+          const { status, data } = await handleRecipes(await readBody(req), env);
           send(data, status);
         } catch (e) {
           send({ error: { message: String(e?.message ?? e) } }, 502);

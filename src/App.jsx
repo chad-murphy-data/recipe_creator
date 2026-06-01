@@ -195,53 +195,26 @@ function applyGrams(grounded, grams) {
   });
 }
 
-// ── Supabase (REST) ────────────────────────────────────────────────────────
-async function saveRecipe(sb, record) {
-  const r = await fetch(`${sb.url}/rest/v1/recipes`, {
+// ── Recipes via the server (/api/recipes) ───────────────────────────────────
+// The browser no longer touches Supabase directly; the server endpoint holds the
+// DB key and is password-gated, so the public key can't be used to read/wipe the
+// box from the bundle. The grounding edge function is still called directly (it's
+// a stateless USDA utility with no DB access).
+async function recipesApi(action, payload) {
+  const r = await fetch("/api/recipes", {
     method: "POST",
-    headers: {
-      apikey: sb.key,
-      Authorization: `Bearer ${sb.key}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(record),
+    headers: { "Content-Type": "application/json", "x-app-password": appPassword() },
+    body: JSON.stringify({ action, ...payload }),
   });
-  if (!r.ok) throw new Error(`Supabase save failed (${r.status}): ${await r.text()}`);
-  return (await r.json())[0];
+  const d = await r.json();
+  if (!r.ok) throw new Error(d?.error?.message || `Recipes request failed (${r.status})`);
+  return d;
 }
 
-async function loadRecipes(sb) {
-  const r = await fetch(
-    `${sb.url}/rest/v1/recipes?select=*&order=created_at.desc`,
-    { headers: { apikey: sb.key, Authorization: `Bearer ${sb.key}` } }
-  );
-  if (!r.ok) throw new Error(`Supabase load failed (${r.status})`);
-  return r.json();
-}
-
-async function updateRecipe(sb, id, patch) {
-  const r = await fetch(`${sb.url}/rest/v1/recipes?id=eq.${id}`, {
-    method: "PATCH",
-    headers: {
-      apikey: sb.key,
-      Authorization: `Bearer ${sb.key}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(patch),
-  });
-  if (!r.ok) throw new Error(`Supabase update failed (${r.status}): ${await r.text()}`);
-  return (await r.json())[0];
-}
-
-async function deleteRecipe(sb, id) {
-  const r = await fetch(`${sb.url}/rest/v1/recipes?id=eq.${id}`, {
-    method: "DELETE",
-    headers: { apikey: sb.key, Authorization: `Bearer ${sb.key}` },
-  });
-  if (!r.ok) throw new Error(`Supabase delete failed (${r.status}): ${await r.text()}`);
-}
+const saveRecipe = (record) => recipesApi("create", { record });
+const loadRecipes = () => recipesApi("list", {});
+const updateRecipe = (id, patch) => recipesApi("update", { id, patch });
+const deleteRecipe = (id) => recipesApi("delete", { id });
 
 // ─────────────────────────────────────────────────────────────────────────
 //  UI
@@ -290,7 +263,7 @@ export default function App() {
 
   async function refreshBox() {
     try {
-      setBox(await loadRecipes(sb));
+      setBox(await loadRecipes());
     } catch (e) {
       setErr(e.message);
     }
@@ -421,7 +394,7 @@ export default function App() {
   async function keep() {
     setErr("");
     try {
-      await saveRecipe(sb, current);
+      await saveRecipe(current);
       setCurrent(null);
       setTab("box");
       await refreshBox();
@@ -436,7 +409,7 @@ export default function App() {
     const prev = box;
     setBox((b) => b.map((r) => (r.id === id ? { ...r, ...patch } : r)));
     try {
-      await updateRecipe(sb, id, patch);
+      await updateRecipe(id, patch);
     } catch (e) {
       setBox(prev);
       setErr(e.message);
@@ -448,7 +421,7 @@ export default function App() {
     const prev = box;
     setBox((b) => b.filter((r) => r.id !== id));
     try {
-      await deleteRecipe(sb, id);
+      await deleteRecipe(id);
     } catch (e) {
       setBox(prev);
       setErr(e.message);

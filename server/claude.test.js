@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { handleClaudeRequest } from "./claude.js";
+import { _resetRateLimit } from "./ratelimit.js";
 
 const ENV = { ANTHROPIC_API_KEY: "sk-test", APP_PASSWORD: "" };
 
@@ -27,6 +28,7 @@ test("missing API key is a clear 500", async () => {
 });
 
 test("a truncated (max_tokens) response becomes a clear 502, not a half-object", async () => {
+  _resetRateLimit();
   const restore = stubFetch({
     stop_reason: "max_tokens",
     content: [{ type: "text", text: '{"title":"half a recipe' }],
@@ -41,6 +43,7 @@ test("a truncated (max_tokens) response becomes a clear 502, not a half-object",
 });
 
 test("a normal completed response passes through", async () => {
+  _resetRateLimit();
   const restore = stubFetch({
     stop_reason: "end_turn",
     content: [{ type: "text", text: '{"title":"ok"}' }],
@@ -51,5 +54,31 @@ test("a normal completed response passes through", async () => {
     assert.equal(r.data.content[0].text, '{"title":"ok"}');
   } finally {
     restore();
+  }
+});
+
+test("spend cap returns 429 once the limit is exceeded", async () => {
+  _resetRateLimit();
+  const restore = stubFetch({ stop_reason: "end_turn", content: [{ type: "text", text: "{}" }] });
+  const env = { ...ENV, CLAUDE_RATE_MAX: 3, CLAUDE_RATE_WINDOW_S: 600 };
+  try {
+    for (let i = 0; i < 3; i++) {
+      const ok = await handleClaudeRequest({ user: "x" }, "", env);
+      assert.equal(ok.status, 200);
+    }
+    const blocked = await handleClaudeRequest({ user: "x" }, "", env);
+    assert.equal(blocked.status, 429);
+    assert.match(blocked.data.error.message, /rate limit/i);
+  } finally {
+    restore();
+  }
+});
+
+test("auth_check is not rate limited", async () => {
+  _resetRateLimit();
+  const env = { ...ENV, CLAUDE_RATE_MAX: 1, CLAUDE_RATE_WINDOW_S: 600 };
+  for (let i = 0; i < 5; i++) {
+    const r = await handleClaudeRequest({ auth_check: true }, "", env);
+    assert.equal(r.status, 200);
   }
 });
