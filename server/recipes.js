@@ -28,11 +28,19 @@ function clean(record) {
   return out;
 }
 
+// Public fallbacks (same values the client bakes in) so the box can't break just
+// because a Supabase env var is missing. Order: SECRET key (the real lock, lets us
+// shut RLS) -> any configured public key -> the baked publishable key. The
+// publishable fallback works only while RLS is still open; once RLS is locked the
+// SECRET key must be set, which is the intended "armed" state.
+const DEFAULT_URL = "https://nwgxyytowbluuykbdcfc.supabase.co";
+const DEFAULT_PUBLISHABLE = "sb_publishable_MF7iftdZykPrfelnVnJHew_DSuyVLJ1";
+
 function dbKey(env) {
-  return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY || env.VITE_SUPABASE_ANON_KEY || "";
+  return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY || env.VITE_SUPABASE_ANON_KEY || DEFAULT_PUBLISHABLE;
 }
 function dbUrl(env) {
-  return (env.SUPABASE_URL || env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
+  return (env.SUPABASE_URL || env.VITE_SUPABASE_URL || DEFAULT_URL).replace(/\/$/, "");
 }
 
 async function sb(env, path, init = {}) {

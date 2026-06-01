@@ -80,12 +80,22 @@ test("uses the service key when present, Authorization bearer set", async () => 
   } finally { restore(); }
 });
 
-test("falls back to the public key when no service key is set", async () => {
+test("falls back to a configured public key when no service key is set", async () => {
   const cap = {};
   const restore = stubFetch(cap);
   try {
     await handleRecipes({ action: "list" }, { SUPABASE_URL: ENV.SUPABASE_URL, VITE_SUPABASE_ANON_KEY: "pub" });
     assert.equal(cap.init.headers.apikey, "pub");
+  } finally { restore(); }
+});
+
+test("falls back to baked URL + publishable key when nothing is configured", async () => {
+  const cap = {};
+  const restore = stubFetch(cap);
+  try {
+    await handleRecipes({ action: "list" }, {}); // empty env
+    assert.match(cap.url, /^https:\/\/nwgxyytowbluuykbdcfc\.supabase\.co\/rest\/v1\//);
+    assert.match(cap.init.headers.apikey, /^sb_publishable_/);
   } finally { restore(); }
 });
 
