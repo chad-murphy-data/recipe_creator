@@ -429,6 +429,11 @@ export default function App() {
     .step { margin:8px 0; padding-left:26px; position:relative; font-size:14px; }
     .step .n { position:absolute; left:0; font-family:'Fraunces'; font-weight:600; color:#9c3d2e; }
     .note { font-style:italic; color:#8a7a5c; font-size:13px; margin-top:8px; }
+    .bd { width:100%; border-collapse:collapse; font-size:12.5px; font-variant-numeric:tabular-nums; }
+    .bd th, .bd td { padding:5px 8px; text-align:right; border-bottom:1px solid #ece2cd; white-space:nowrap; }
+    .bd th { font-size:10px; text-transform:uppercase; letter-spacing:0.6px; color:#8a7a5c; font-weight:600; }
+    .bd tbody tr:nth-child(odd) td { background:#fbf6ec; }
+    .bd .bd-total td { font-weight:600; border-top:1.5px solid #2b2622; background:#f4ede1 !important; }
   `;
 
   return (
@@ -558,6 +563,9 @@ function LockCard({ onUnlock }) {
 
 function RecipeCard({ r, onKeep, keepLabel }) {
   const fiber = r.actual_fiber_g;
+  const [showBreakdown, setShowBreakdown] = useState(false);
+  const ings = r.ingredients || [];
+  const hasContrib = ings.some((i) => i.contributes);
   return (
     <div className="card">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -582,12 +590,25 @@ function RecipeCard({ r, onKeep, keepLabel }) {
       </div>
 
       <h3 style={{ marginBottom: 6 }}>Ingredients</h3>
-      {(r.ingredients || []).map((i, n) => (
+      {ings.map((i, n) => (
         <div className="ing" key={n}>
           <span>{i.grams_cooked}g {i.name}</span>
           <span className="src">{i.fdcDescription} · FDC {i.fdcId}</span>
         </div>
       ))}
+
+      {hasContrib && (
+        <>
+          <button
+            className="btn ghost"
+            style={{ marginTop: 10, padding: "6px 12px", fontSize: 13 }}
+            onClick={() => setShowBreakdown((v) => !v)}
+          >
+            {showBreakdown ? "Hide macro breakdown" : "Show macro breakdown"}
+          </button>
+          {showBreakdown && <MacroBreakdown ings={ings} r={r} />}
+        </>
+      )}
 
       <h3 style={{ marginBottom: 6, marginTop: 16 }}>Method</h3>
       {(r.steps || []).map((s, n) => (
@@ -601,6 +622,57 @@ function RecipeCard({ r, onKeep, keepLabel }) {
           <button className="btn" onClick={onKeep}>{keepLabel}</button>
         </div>
       )}
+    </div>
+  );
+}
+
+// Per-ingredient macro contributions + a totals row, for spot-checking accuracy.
+// `contributes` comes straight from grounding (recomputed by the solver after
+// portioning), so this is the authoritative per-ingredient math, not a re-estimate.
+function MacroBreakdown({ ings, r }) {
+  const n1 = (x) => (x == null ? "—" : (Math.round(x * 10) / 10).toString());
+  const sum = (k) => ings.reduce((s, i) => s + (i.contributes?.[k] || 0), 0);
+  const cols = [
+    ["kcal", "kcal"],
+    ["protein", "protein"],
+    ["fat", "fat"],
+    ["carbs", "carbs"],
+    ["fiber", "fiber"],
+  ];
+  return (
+    <div style={{ overflowX: "auto", marginTop: 10 }}>
+      <table className="bd">
+        <thead>
+          <tr>
+            <th style={{ textAlign: "left" }}>ingredient</th>
+            <th>g</th>
+            {cols.map(([, label]) => <th key={label}>{label}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {ings.map((i, idx) => (
+            <tr key={idx}>
+              <td style={{ textAlign: "left" }}>{i.name}</td>
+              <td>{i.grams_cooked}</td>
+              {cols.map(([k]) => <td key={k}>{n1(i.contributes?.[k])}</td>)}
+            </tr>
+          ))}
+          <tr className="bd-total">
+            <td style={{ textAlign: "left" }}>total (sum)</td>
+            <td>{ings.reduce((s, i) => s + (i.grams_cooked || 0), 0)}</td>
+            {cols.map(([k]) => <td key={k}>{n1(sum(k))}</td>)}
+          </tr>
+          <tr className="bd-total">
+            <td style={{ textAlign: "left" }}>saved totals</td>
+            <td>—</td>
+            <td>{n1(r.actual_calories)}</td>
+            <td>{n1(r.actual_protein_g)}</td>
+            <td>{n1(r.actual_fat_g)}</td>
+            <td>{n1(r.actual_carbs_g)}</td>
+            <td>{n1(r.actual_fiber_g)}</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   );
 }
