@@ -111,7 +111,14 @@ export function solvePortions(grounded, targets, opts = {}) {
     };
   });
   const b = grounded.map(boundsFor);
-  const grams = b.map((x) => Math.min(x.hi, Math.max(x.lo, x.proposed)));
+  // `locked` ingredients are held at their current weight (the user pinned them,
+  // e.g. "salmon at 200g"); the rest solve around them.
+  const locked = new Set(opts.locked || []);
+  const grams = b.map((x, i) =>
+    locked.has(i)
+      ? Math.max(0, grounded[i].grams_cooked ?? x.proposed)
+      : Math.min(x.hi, Math.max(x.lo, x.proposed))
+  );
 
   // Running totals (fiber solved two-sided here for clean math; the real
   // one-sided fiber check happens in offTarget at the end).
@@ -120,6 +127,7 @@ export function solvePortions(grounded, targets, opts = {}) {
 
   for (let s = 0; s < sweeps; s++) {
     for (let i = 0; i < n; i++) {
+      if (locked.has(i)) continue; // never move a pinned ingredient
       for (const k of KEYS) tot[k] -= grams[i] * a[i][k]; // strip i -> rest
       let num = 0, den = 0;
       for (const k of KEYS) {
@@ -145,4 +153,22 @@ export function solvePortions(grounded, targets, opts = {}) {
   }));
 
   return { grams: finalGrams, total, withinTolerance: misses.length === 0, misses, changes };
+}
+
+// Apply gram weights onto grounded ingredients: update grams_cooked and recompute
+// each ingredient's macro contribution. Shared by the pipeline and the live editor
+// so displayed/saved numbers always match the per-100g math.
+export function applyGrams(grounded, grams) {
+  return grounded.map((g, i) => {
+    const f = (grams[i] ?? 0) / 100;
+    const p = g.per100g || {};
+    return {
+      ...g,
+      grams_cooked: grams[i],
+      contributes: {
+        kcal: (p.kcal || 0) * f, protein: (p.protein || 0) * f, fat: (p.fat || 0) * f,
+        carbs: (p.carbs || 0) * f, fiber: (p.fiber || 0) * f,
+      },
+    };
+  });
 }

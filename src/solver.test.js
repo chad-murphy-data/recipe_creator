@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { solvePortions, totalsFromGrams, offTarget, TOL } from "./solver.js";
+import { solvePortions, applyGrams, totalsFromGrams, offTarget, TOL } from "./solver.js";
 
 // Realistic per-100g macro vectors (USDA-ish), so the tests exercise the same
 // shapes the live edge function returns.
@@ -97,6 +97,41 @@ test("is deterministic: same input solves identically", () => {
   ];
   const a = solvePortions(grounded, TARGETS);
   const b = solvePortions(grounded, TARGETS);
+  assert.deepEqual(a.grams, b.grams);
+});
+
+test("locked ingredients are held while the rest rebalance (Charlie's 200g salmon case)", () => {
+  const salmon = { kcal: 208, protein: 20, fat: 13, carbs: 0, fiber: 0 };
+  const grounded = [
+    ing("Salmon", salmon, 200, "protein"), // she pinned this at 200g
+    ing("Brown rice", P.brownRice, 150, "carb"),
+    ing("Broccoli", P.broccoli, 100, "veg"),
+    ing("Edamame", P.edamame, 60, "legume"),
+    ing("Sesame oil", P.oil, 5, "oil"),
+  ];
+  const r = solvePortions(grounded, TARGETS, { locked: [0] });
+  assert.equal(r.grams[0], 200, "locked salmon must stay exactly 200g");
+  // and at least one other ingredient moved to compensate
+  assert.ok(r.changes.slice(1).some((c) => c.from !== c.to), "other ingredients should rebalance");
+});
+
+test("applyGrams recomputes contributions from per-100g", () => {
+  const grounded = [ing("Chicken", P.chicken, 100, "protein")];
+  const out = applyGrams(grounded, [200]);
+  assert.equal(out[0].grams_cooked, 200);
+  assert.equal(Math.round(out[0].contributes.protein), 62);
+  assert.equal(Math.round(out[0].contributes.kcal), 330);
+});
+
+test("no locks behaves exactly like a normal solve", () => {
+  const grounded = [
+    ing("Chicken breast", P.chicken, 150, "protein"),
+    ing("Brown rice", P.brownRice, 200, "carb"),
+    ing("Edamame", P.edamame, 75, "legume"),
+    ing("Sesame oil", P.oil, 5, "oil"),
+  ];
+  const a = solvePortions(grounded, TARGETS);
+  const b = solvePortions(grounded, TARGETS, { locked: [] });
   assert.deepEqual(a.grams, b.grams);
 });
 
