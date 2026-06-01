@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { solvePortions, offTarget, TOL } from "./solver.js";
+import { resolveStaple } from "./staples.js";
 
 // ─────────────────────────────────────────────────────────────────────────
 //  Charlie's Recipe Box
@@ -143,12 +144,16 @@ ${recipe.steps.map((s, n) => `${n + 1}. ${s}`).join("\n")}`;
 // ── Grounding: delegate to edge function, then log results ───────────────
 // We carry the model's "role" onto each grounded ingredient so the solver knows
 // how far it may adjust each amount (the edge function doesn't echo role back).
+// Staples resolve to a pinned fdcId, which the edge function fetches directly,
+// skipping the fuzzy search for Charlie's regulars.
 async function groundRecipe(recipe, sb, log) {
   log(`  Sending ${recipe.ingredients.length} ingredients to USDA grounding…`);
-  const { grounded, total } = await groundViaEdge(
-    sb,
-    recipe.ingredients.map((i) => ({ name: i.name, usdaQuery: i.usdaQuery, grams: i.grams, match: i.match }))
-  );
+  const payload = recipe.ingredients.map((i) => {
+    const pin = resolveStaple(i.match);
+    if (pin) log(`    · ${i.name}: pinned to ${pin.label} (FDC ${pin.fdcId})`);
+    return { name: i.name, usdaQuery: i.usdaQuery, grams: i.grams, match: i.match, fdcId: pin?.fdcId };
+  });
+  const { grounded, total } = await groundViaEdge(sb, payload);
   grounded.forEach((g, idx) => {
     if (recipe.ingredients[idx]) g.role = recipe.ingredients[idx].role;
   });
