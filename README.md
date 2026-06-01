@@ -36,6 +36,21 @@ The model designs the food; code owns the numbers. The model never sees a
 nutrition number it can game, and the judge never sees a number it could be
 seduced into chasing. That split is the whole point.
 
+## The box
+
+Saved recipes live in **The box**, with:
+
+- **Status**: mark each recipe Liked / Disliked / Haven't tried (shown as a pill).
+- **Tags**: add freeform tags; remove by clicking them.
+- **Search and filter**: by text (title, ingredient, or tag), by status, and by tag.
+- **Reroll with a note**: describe a change ("too many sides, pick one veg") and
+  it regenerates a fresh recipe on the Make tab. Non-destructive: the original
+  stays in the box.
+- **Delete** (with a confirm).
+
+The generator also gets a **variety nudge**: recent box titles are passed in with
+"make something different," so it stops defaulting to the same dish every run.
+
 ## Tests
 
 ```bash
@@ -45,7 +60,9 @@ npm test
 `src/solver.test.js` proves the precision engine: it hits realistic targets,
 trims a carb-heavy ingredient instead of zeroing it, refuses to inflate calories
 with oil, reports infeasible ingredient sets instead of silently saving off
-target, and is deterministic.
+target, and is deterministic. `src/staples.test.js` covers the pinned-staple
+lookup, and `server/claude.test.js` covers the proxy (password gate, token-limit
+handling).
 
 ## Stack
 
@@ -116,9 +133,10 @@ variables):
    project `nwgxyytowbluuykbdcfc` > Edge Functions > Secrets > `USDA_API_KEY`. Or
    via CLI: `supabase secrets set USDA_API_KEY=... --project-ref nwgxyytowbluuykbdcfc`.
    Free key: https://fdc.nal.usda.gov/api-key-signup.html
-2. **RLS is permissive.** The `recipes` table allows public read and insert via
-   the anon key (no user login). Fine for a private deploy; add real auth before
-   sharing it.
+2. **RLS is permissive.** The `recipes` table allows public read, insert, update,
+   and delete via the anon key (no user login). This is what makes the box
+   editable for a private demo, but it means anyone with the URL can change or
+   delete recipes. Add real auth and per-user rows before sharing it (Phase 4).
 3. **Ingredient matching** now validates that the chosen USDA entry contains the
    Generator's `match` term and searches Foundation, SR Legacy, and Survey
    (FNDDS). If nothing matches, that ingredient fails loudly instead of resolving
