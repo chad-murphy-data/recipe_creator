@@ -105,7 +105,7 @@ function parseJSON(text) {
 // The model designs the DISH. It does not have to nail the macros: code solves
 // the exact gram weights afterward. Its grams are just a sensible starting point,
 // and its "role" tags tell the solver how far each ingredient may be adjusted.
-async function generateRecipe(targets, prefs, feedback) {
+async function generateRecipe(targets, prefs, feedback, avoidTitles) {
   const system = `You design dinner recipes for ONE serving. A separate program will fine-tune the exact gram weights to hit macro targets, so you do not need to nail the numbers. Your job is a real, appealing, balanced dish with the right KINDS and rough amounts of food.
 
 HARD RULES:
@@ -125,8 +125,16 @@ Respond ONLY with JSON, no prose, no backticks:
   "steps": ["step 1","step 2"]
 }`;
 
+  // Variety nudge: the inputs are otherwise identical every run, so the model
+  // keeps landing on the same obvious dish (umami + chicken = miso chicken).
+  // Showing it what to avoid breaks the loop without touching the targets.
+  const avoid = (avoidTitles || []).filter(Boolean).slice(0, 8);
+  const variety = avoid.length
+    ? `\nMake something genuinely DIFFERENT from these recent recipes (vary the cuisine and the main protein, do not just rename): ${avoid.join("; ")}.`
+    : "";
+
   const user = `Targets (per serving): ${targets.calories} kcal, ${targets.protein_g}g protein, ${targets.carbs_g}g carbs, ${targets.fiber_g}g fiber.
-Preferences: ${prefs}
+Preferences: ${prefs}${variety}
 ${feedback ? `\nREVISION NEEDED:\n${feedback}` : ""}`;
 
   return parseJSON(await callClaude(system, user));
@@ -212,6 +220,29 @@ async function loadRecipes(sb) {
   return r.json();
 }
 
+async function updateRecipe(sb, id, patch) {
+  const r = await fetch(`${sb.url}/rest/v1/recipes?id=eq.${id}`, {
+    method: "PATCH",
+    headers: {
+      apikey: sb.key,
+      Authorization: `Bearer ${sb.key}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error(`Supabase update failed (${r.status}): ${await r.text()}`);
+  return (await r.json())[0];
+}
+
+async function deleteRecipe(sb, id) {
+  const r = await fetch(`${sb.url}/rest/v1/recipes?id=eq.${id}`, {
+    method: "DELETE",
+    headers: { apikey: sb.key, Authorization: `Bearer ${sb.key}` },
+  });
+  if (!r.ok) throw new Error(`Supabase delete failed (${r.status}): ${await r.text()}`);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  UI
 // ─────────────────────────────────────────────────────────────────────────
@@ -265,13 +296,24 @@ export default function App() {
     }
   }
 
-  async function run() {
+  async function run(opts = {}) {
+    const { rerollNote = "", baseRecipe = null } = opts;
     setErr("");
     setLogLines([]);
     setCurrent(null);
     setBusy(true);
+    setTab("make");
     try {
-      let feedback = "";
+      // Variety: avoid repeating the current candidate, the saved box, and (on a
+      // reroll) the recipe being rerolled.
+      const avoidTitles = [
+        baseRecipe?.title,
+        ...box.map((b) => b.title),
+      ];
+      // A reroll note is a user-driven revision request; feed it like feedback.
+      let feedback = rerollNote
+        ? `The user wants this changed: "${rerollNote}". Keep what works, address that note.`
+        : "";
       let recipe = null;
       let grounded = null;
       let solved = null;
@@ -281,7 +323,7 @@ export default function App() {
       //    any portioning (then it swaps an ingredient, not re-guesses grams).
       for (let round = 1; round <= MAX_SWAP_ROUNDS; round++) {
         log(round === 1 ? `Generator…` : `Generator — swapping an ingredient (round ${round})…`);
-        recipe = await generateRecipe(targets, prefs, feedback);
+        recipe = await generateRecipe(targets, prefs, feedback, avoidTitles);
         log(`Proposed: "${recipe.title}". Grounding in USDA…`);
         ({ grounded } = await groundRecipe(recipe, sb, log));
 
@@ -330,7 +372,8 @@ export default function App() {
         recipe = await generateRecipe(
           targets,
           prefs,
-          `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem. Amounts will be re-tuned automatically, so focus on the dish itself.`
+          `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem. Amounts will be re-tuned automatically, so focus on the dish itself.`,
+          avoidTitles
         );
         log(`Revised for taste: "${recipe.title}". Re-grounding and re-solving…`);
         ({ grounded } = await groundRecipe(recipe, sb, log));
@@ -387,6 +430,37 @@ export default function App() {
     }
   }
 
+  // Optimistic box edits: update local state immediately, persist, roll back on error.
+  async function patchBoxRecipe(id, patch) {
+    setErr("");
+    const prev = box;
+    setBox((b) => b.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+    try {
+      await updateRecipe(sb, id, patch);
+    } catch (e) {
+      setBox(prev);
+      setErr(e.message);
+    }
+  }
+
+  async function removeBoxRecipe(id) {
+    setErr("");
+    const prev = box;
+    setBox((b) => b.filter((r) => r.id !== id));
+    try {
+      await deleteRecipe(sb, id);
+    } catch (e) {
+      setBox(prev);
+      setErr(e.message);
+    }
+  }
+
+  // Reroll: regenerate from a saved recipe with the user's change note. Produces
+  // a fresh candidate on the Make tab (non-destructive; the original stays put).
+  function rerollFromBox(recipe, note) {
+    run({ rerollNote: note, baseRecipe: recipe });
+  }
+
   // ── styles ───────────────────────────────────────────────────────────────
   const css = `
     @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&family=Spline+Sans:wght@400;500;600&display=swap');
@@ -434,6 +508,15 @@ export default function App() {
     .bd th { font-size:10px; text-transform:uppercase; letter-spacing:0.6px; color:#8a7a5c; font-weight:600; }
     .bd tbody tr:nth-child(odd) td { background:#fbf6ec; }
     .bd .bd-total td { font-weight:600; border-top:1.5px solid #2b2622; background:#f4ede1 !important; }
+    .pill.status-liked { background:#dcecd0; color:#3a5a28; }
+    .pill.status-disliked { background:#f7dcd7; color:#9c3d2e; }
+    .pill.status-untried { background:#ece2cd; color:#8a7a5c; }
+    .chip { font-family:'Spline Sans'; font-size:12px; font-weight:600; padding:5px 11px; border-radius:99px;
+      border:1.5px solid #d8c9ad; background:#fffdf8; color:#8a7a5c; cursor:pointer; }
+    .chip:hover { border-color:#2b2622; }
+    .chip-on { background:#2b2622; color:#f4ede1; border-color:#2b2622; }
+    .field select { width:100%; padding:8px 10px; border:1.5px solid #d8c9ad; border-radius:3px;
+      font-family:'Spline Sans'; font-size:14px; background:#fff; }
   `;
 
   return (
@@ -486,7 +569,7 @@ export default function App() {
                     <label>Preferences</label>
                     <textarea rows={2} value={prefs} onChange={(e) => setPrefs(e.target.value)} />
                   </div>
-                  <button className="btn" disabled={!ready || busy} onClick={run}>
+                  <button className="btn" disabled={!ready || busy} onClick={() => run()}>
                     {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Supabase not configured"}
                   </button>
                 </div>
@@ -503,12 +586,13 @@ export default function App() {
             )}
 
             {tab === "box" && (
-              <>
-                {box.length === 0 && <div className="card">No recipes yet. Go make one.</div>}
-                {box.map((r) => (
-                  <RecipeCard key={r.id} r={r} />
-                ))}
-              </>
+              <BoxTab
+                box={box}
+                onSetStatus={(id, status) => patchBoxRecipe(id, { status })}
+                onSetTags={(id, tags) => patchBoxRecipe(id, { tags })}
+                onDelete={removeBoxRecipe}
+                onReroll={rerollFromBox}
+              />
             )}
           </>
         )}
@@ -561,16 +645,109 @@ function LockCard({ onUnlock }) {
   );
 }
 
-function RecipeCard({ r, onKeep, keepLabel }) {
+const STATUSES = [
+  { key: "untried", label: "Haven't tried" },
+  { key: "liked", label: "Liked" },
+  { key: "disliked", label: "Disliked" },
+];
+const statusLabel = (s) => (STATUSES.find((x) => x.key === s) || STATUSES[0]).label;
+
+function BoxTab({ box, onSetStatus, onSetTags, onDelete, onReroll }) {
+  const [q, setQ] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [tagFilter, setTagFilter] = useState("all");
+
+  const allTags = Array.from(
+    new Set(box.flatMap((r) => r.tags || []))
+  ).sort();
+
+  const needle = q.trim().toLowerCase();
+  const filtered = box.filter((r) => {
+    if (statusFilter !== "all" && (r.status || "untried") !== statusFilter) return false;
+    if (tagFilter !== "all" && !(r.tags || []).includes(tagFilter)) return false;
+    if (needle) {
+      const hay = [
+        r.title,
+        ...(r.ingredients || []).map((i) => i.name),
+        ...(r.tags || []),
+      ].join(" ").toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
+
+  if (box.length === 0) return <div className="card">No recipes yet. Go make one.</div>;
+
+  return (
+    <>
+      <div className="card" style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div className="field" style={{ marginBottom: 0, flex: 2 }}>
+          <label>Search</label>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="title, ingredient, or tag" />
+        </div>
+        <div className="field" style={{ marginBottom: 0, flex: 1 }}>
+          <label>Status</label>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">All</option>
+            {STATUSES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+        </div>
+        {allTags.length > 0 && (
+          <div className="field" style={{ marginBottom: 0, flex: 1 }}>
+            <label>Tag</label>
+            <select value={tagFilter} onChange={(e) => setTagFilter(e.target.value)}>
+              <option value="all">All</option>
+              {allTags.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {filtered.length === 0 && <div className="card">Nothing matches that filter.</div>}
+      {filtered.map((r) => (
+        <RecipeCard
+          key={r.id}
+          r={r}
+          onSetStatus={onSetStatus}
+          onSetTags={onSetTags}
+          onDelete={onDelete}
+          onReroll={onReroll}
+        />
+      ))}
+    </>
+  );
+}
+
+function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, onReroll }) {
+  const isBoxed = Boolean(onSetStatus || onDelete || onReroll);
   const fiber = r.actual_fiber_g;
   const [showBreakdown, setShowBreakdown] = useState(false);
+  const [showReroll, setShowReroll] = useState(false);
+  const [rerollNote, setRerollNote] = useState("");
+  const [tagInput, setTagInput] = useState("");
   const ings = r.ingredients || [];
   const hasContrib = ings.some((i) => i.contributes);
+  const status = r.status || "untried";
+
+  function addTag() {
+    const t = tagInput.trim().toLowerCase();
+    if (!t) return;
+    const next = Array.from(new Set([...(r.tags || []), t]));
+    onSetTags(r.id, next);
+    setTagInput("");
+  }
+  function removeTag(t) {
+    onSetTags(r.id, (r.tags || []).filter((x) => x !== t));
+  }
+
   return (
     <div className="card">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <h2 style={{ margin: "0 0 4px" }}>{r.title}</h2>
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {isBoxed && (
+            <span className={`pill status-${status}`}>{statusLabel(status)}</span>
+          )}
           {r.on_target === false && <span className="pill warn">macros off</span>}
           <span className={`pill ${r.palatability_passed ? "ok" : "warn"}`}>
             {r.palatability_passed ? "taste ✓" : "needs a look"}
@@ -620,6 +797,77 @@ function RecipeCard({ r, onKeep, keepLabel }) {
       {onKeep && (
         <div style={{ marginTop: 16 }}>
           <button className="btn" onClick={onKeep}>{keepLabel}</button>
+        </div>
+      )}
+
+      {isBoxed && (
+        <div style={{ marginTop: 16, borderTop: "1px solid #ece2cd", paddingTop: 14 }}>
+          {/* Status */}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.8px", color: "#8a7a5c", fontWeight: 600, marginRight: 4 }}>Status</span>
+            {STATUSES.map((s) => (
+              <button
+                key={s.key}
+                className={`chip ${status === s.key ? "chip-on" : ""}`}
+                onClick={() => onSetStatus(r.id, s.key)}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Tags */}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.8px", color: "#8a7a5c", fontWeight: 600, marginRight: 4 }}>Tags</span>
+            {(r.tags || []).map((t) => (
+              <span key={t} className="chip chip-on" onClick={() => removeTag(t)} title="Remove tag" style={{ cursor: "pointer" }}>
+                {t} ✕
+              </span>
+            ))}
+            <input
+              value={tagInput}
+              onChange={(e) => setTagInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addTag(); } }}
+              placeholder="add tag"
+              style={{ border: "1.5px solid #d8c9ad", borderRadius: 3, padding: "4px 8px", fontFamily: "'Spline Sans'", fontSize: 13, width: 110 }}
+            />
+          </div>
+
+          {/* Actions */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn ghost" style={{ padding: "8px 14px", fontSize: 13 }} onClick={() => setShowReroll((v) => !v)}>
+              {showReroll ? "Cancel reroll" : "Ask for a reroll"}
+            </button>
+            <button
+              className="btn ghost"
+              style={{ padding: "8px 14px", fontSize: 13, borderColor: "#9c3d2e", color: "#9c3d2e" }}
+              onClick={() => { if (confirm(`Delete "${r.title}"? This can't be undone.`)) onDelete(r.id); }}
+            >
+              Delete
+            </button>
+          </div>
+
+          {showReroll && (
+            <div style={{ marginTop: 12 }}>
+              <div className="field" style={{ marginBottom: 8 }}>
+                <label>What should change?</label>
+                <textarea
+                  rows={2}
+                  value={rerollNote}
+                  onChange={(e) => setRerollNote(e.target.value)}
+                  placeholder='e.g. "too many sides, pick one veg" or "make it spicier"'
+                />
+              </div>
+              <button
+                className="btn"
+                disabled={!rerollNote.trim()}
+                onClick={() => { onReroll(r, rerollNote.trim()); setShowReroll(false); setRerollNote(""); }}
+              >
+                Reroll this recipe
+              </button>
+              <div className="note" style={{ marginTop: 6 }}>Creates a new recipe on the Make tab. The original stays here.</div>
+            </div>
+          )}
         </div>
       )}
     </div>
