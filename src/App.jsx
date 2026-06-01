@@ -6,16 +6,16 @@ import React, { useState, useEffect, useRef } from "react";
 //  by a blind palatability judge. Saved to Supabase.
 //
 //  Pipeline per request:
-//    1. Generator    -> proposes recipe w/ specific USDA fdcIds + cooked grams
-//    2. Grounding    -> code queries USDA, computes authoritative macros
+//    1. Generator    -> proposes recipe w/ USDA query + match term + cooked grams
+//    2. Grounding    -> code queries USDA, validates the match, computes macros
 //    3. Reconcile    -> off-target? loop back to Generator w/ real shortfall
 //    4. Palatability -> blind judge (no macros) approves or kicks back
 //    5. Re-ground    -> recompute after any taste edit; macros can't silently drift
 //    6. Save         -> Supabase
 //
 //  The Generator and judge run through /api/claude, a server-side proxy that
-//  holds the Anthropic key (Vite dev middleware locally, Netlify function in
-//  production). The key never reaches the browser.
+//  holds the Anthropic key and enforces the app password. Neither reaches the
+//  browser.
 // ─────────────────────────────────────────────────────────────────────────
 
 const MAX_MACRO_ROUNDS = 4;
@@ -32,11 +32,14 @@ const DEFAULT_TARGETS = {
 };
 
 const DEFAULT_PREFS =
-  "Loves umami flavors. Skinless boneless chicken breast is a workhorse protein. No hard dislikes or allergies. Avoid burying a dish in any single garnish to hit a number — balance is the point.";
+  "Loves umami flavors. Skinless boneless chicken breast is a workhorse protein. No hard dislikes or allergies. Avoid burying a dish in any single garnish to hit a number, balance is the point.";
 
 // Public client defaults; can be overridden by env vars or the Setup tab.
 const ENV_SB_URL = import.meta.env.VITE_SUPABASE_URL || "https://nwgxyytowbluuykbdcfc.supabase.co";
 const ENV_SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+
+const appPassword = () =>
+  (typeof sessionStorage !== "undefined" && sessionStorage.getItem("rb_pw")) || "";
 
 // ── USDA grounding via Supabase edge function (server-side, no CORS/sandbox issue) ──
 async function groundViaEdge(sb, ingredients) {
@@ -54,12 +57,13 @@ async function groundViaEdge(sb, ingredients) {
   return d; // { grounded, total }
 }
 
-// ── Recipe engine (Generator + judge) via the server-side Anthropic proxy ──
-// See server/claude.js. The key and model live on the server, not here.
+// ── Recipe engine (Generator + judge) via the server-side proxy ──────────────
+// See server/claude.js. The Anthropic key, model, and password live on the
+// server. We just pass the entered password through for the server to check.
 async function callClaude(system, userContent) {
   const response = await fetch("/api/claude", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-app-password": appPassword() },
     body: JSON.stringify({ system, user: userContent }),
   });
   const data = await response.json();
@@ -85,6 +89,7 @@ async function generateRecipe(targets, prefs, feedback) {
 HARD RULES:
 - For every ingredient, give a COOKED gram weight (cooked, not raw).
 - For every ingredient, propose a USDA FoodData Central search phrase that will match a COOKED entry (e.g. "chicken breast meat only cooked roasted", "broccoli cooked boiled", "brown rice cooked"). Prefer cooked/roasted/boiled forms.
+- For every ingredient, also give "match": the identifying food word(s) the correct USDA entry MUST contain. Use the distinctive food noun, not preparation words. Examples: "shelled edamame, cooked" -> "edamame"; "low-sodium soy sauce" -> "soy sauce"; "brown rice, cooked" -> "brown rice". Be specific for proteins, grains, and produce; a general word is fine for a minor seasoning (e.g. "vinegar").
 - Do NOT use an absurd quantity of any single ingredient to hit a number. No garnish mountains.
 - Real, appealing, balanced food a person would actually want to eat.
 
@@ -92,7 +97,7 @@ Respond ONLY with JSON, no prose, no backticks:
 {
   "title": "string",
   "ingredients": [
-    {"name":"display name","usdaQuery":"search phrase for a cooked entry","grams":number}
+    {"name":"display name","usdaQuery":"search phrase for a cooked entry","match":"identifying food word(s) that must appear in the USDA entry","grams":number}
   ],
   "steps": ["step 1","step 2"]
 }`;
@@ -106,9 +111,9 @@ ${feedback ? `\nREVISION NEEDED:\n${feedback}` : ""}`;
 
 // ── Palatability judge (blind to macros) ─────────────────────────────────
 async function judgePalatability(recipe) {
-  const system = `You are a discerning home cook. You will see a recipe — title, ingredients with amounts, and steps. You do NOT know any nutrition targets and you do not care about them.
+  const system = `You are a discerning home cook. You will see a recipe: title, ingredients with amounts, and steps. You do NOT know any nutrition targets and you do not care about them.
 
-Answer one question: would a normal person enjoy eating this, and is every ingredient in a sane quantity? Flag anything that looks off — an ingredient in absurd amounts, a bizarre combination, something that would taste bad or unbalanced.
+Answer one question: would a normal person enjoy eating this, and is every ingredient in a sane quantity? Flag anything that looks off, such as an ingredient in absurd amounts, a bizarre combination, or something that would taste bad or unbalanced.
 
 Respond ONLY with JSON:
 {"passes": true/false, "note": "one or two sentences. If it fails, say specifically what to fix."}`;
@@ -127,7 +132,7 @@ async function groundRecipe(recipe, sb, log) {
   log(`  Sending ${recipe.ingredients.length} ingredients to USDA grounding…`);
   const { grounded, total } = await groundViaEdge(
     sb,
-    recipe.ingredients.map((i) => ({ name: i.name, usdaQuery: i.usdaQuery, grams: i.grams }))
+    recipe.ingredients.map((i) => ({ name: i.name, usdaQuery: i.usdaQuery, grams: i.grams, match: i.match }))
   );
   for (const g of grounded) log(`    → ${g.name}: ${g.fdcDescription} (FDC ${g.fdcId})`);
   return { grounded, total };
@@ -188,10 +193,32 @@ export default function App() {
   const [err, setErr] = useState("");
   const logRef = useRef(null);
 
+  // password gate
+  const [unlocked, setUnlocked] = useState(false);
+  const [authChecking, setAuthChecking] = useState(true);
+
   const log = (line) => setLogLines((l) => [...l, line]);
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logLines]);
+
+  // On load, ask the server whether we're already in (valid saved password, or
+  // no password configured at all). A 401 means a password is required.
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch("/api/claude", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-app-password": appPassword() },
+          body: JSON.stringify({ auth_check: true }),
+        });
+        if (r.ok) setUnlocked(true);
+      } catch {
+        /* leave locked; the lock screen will show */
+      }
+      setAuthChecking(false);
+    })();
+  }, []);
 
   const sb = { url: sbUrl.replace(/\/$/, ""), key: sbKey };
   const ready = sbUrl && sbKey;
@@ -360,89 +387,140 @@ export default function App() {
           <div className="sub">Precise to the gram. Checked for joy.</div>
         </div>
 
-        <div className="tabs">
-          {["make", "box", "setup"].map((t) => (
-            <button key={t} className={`tab ${tab === t ? "on" : ""}`} onClick={() => { setTab(t); if (t === "box") refreshBox(); }}>
-              {t === "make" ? "Make a recipe" : t === "box" ? "The box" : "Setup"}
-            </button>
-          ))}
-        </div>
-
-        {err && <div className="err">{err}</div>}
-
-        {tab === "setup" && (
-          <div className="card">
-            <h3 style={{ marginTop: 0 }}>Keys & connection</h3>
-            <p style={{ fontSize: 13, color: "#8a7a5c" }}>
-              Connection settings for this session only; nothing is persisted.
-              The Supabase anon key is safe for client use behind row-level
-              security. Your USDA key lives server-side in the edge function (the
-              USDA_API_KEY secret), and your Anthropic key lives server-side in
-              the recipe proxy (the ANTHROPIC_API_KEY env var). Neither touches
-              the browser.
-            </p>
-            <div className="field">
-              <label>Supabase project URL</label>
-              <input value={sbUrl} onChange={(e) => setSbUrl(e.target.value)} />
-            </div>
-            <div className="field">
-              <label>Supabase anon key</label>
-              <input value={sbKey} onChange={(e) => setSbKey(e.target.value)} placeholder="paste anon/publishable key" />
-            </div>
-          </div>
-        )}
-
-        {tab === "make" && (
+        {authChecking ? (
+          <div className="card">Checking…</div>
+        ) : !unlocked ? (
+          <LockCard onUnlock={() => setUnlocked(true)} />
+        ) : (
           <>
-            <div className="card">
-              <h3 style={{ marginTop: 0 }}>Tonight's targets</h3>
-              <div className="row">
-                {[
-                  ["calories", "Calories"],
-                  ["protein_g", "Protein (g)"],
-                  ["carbs_g", "Carbs (g)"],
-                  ["fiber_g", "Fiber (g)"],
-                ].map(([k, label]) => (
-                  <div className="field" key={k}>
-                    <label>{label}</label>
-                    <input
-                      type="number"
-                      value={targets[k]}
-                      onChange={(e) => setTargets({ ...targets, [k]: +e.target.value })}
-                    />
-                  </div>
-                ))}
-              </div>
-              <div className="field">
-                <label>Preferences</label>
-                <textarea rows={2} value={prefs} onChange={(e) => setPrefs(e.target.value)} />
-              </div>
-              <button className="btn" disabled={!ready || busy} onClick={run}>
-                {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Add Supabase keys in Setup first"}
-              </button>
+            <div className="tabs">
+              {["make", "box", "setup"].map((t) => (
+                <button key={t} className={`tab ${tab === t ? "on" : ""}`} onClick={() => { setTab(t); if (t === "box") refreshBox(); }}>
+                  {t === "make" ? "Make a recipe" : t === "box" ? "The box" : "Setup"}
+                </button>
+              ))}
             </div>
 
-            {logLines.length > 0 && (
+            {err && <div className="err">{err}</div>}
+
+            {tab === "setup" && (
               <div className="card">
-                <h3 style={{ marginTop: 0 }}>Kitchen pass</h3>
-                <div className="log" ref={logRef}>{logLines.join("\n")}</div>
+                <h3 style={{ marginTop: 0 }}>Keys & connection</h3>
+                <p style={{ fontSize: 13, color: "#8a7a5c" }}>
+                  Connection settings for this session only; nothing is persisted.
+                  The Supabase anon key is safe for client use behind row-level
+                  security. Your USDA key lives server-side in the edge function (the
+                  USDA_API_KEY secret), and your Anthropic key and app password live
+                  server-side in the recipe proxy. None of those touch the browser.
+                </p>
+                <div className="field">
+                  <label>Supabase project URL</label>
+                  <input value={sbUrl} onChange={(e) => setSbUrl(e.target.value)} />
+                </div>
+                <div className="field">
+                  <label>Supabase anon key</label>
+                  <input value={sbKey} onChange={(e) => setSbKey(e.target.value)} placeholder="paste anon/publishable key" />
+                </div>
               </div>
             )}
 
-            {current && <RecipeCard r={current} onKeep={keep} keepLabel="Add to the box" />}
-          </>
-        )}
+            {tab === "make" && (
+              <>
+                <div className="card">
+                  <h3 style={{ marginTop: 0 }}>Tonight's targets</h3>
+                  <div className="row">
+                    {[
+                      ["calories", "Calories"],
+                      ["protein_g", "Protein (g)"],
+                      ["carbs_g", "Carbs (g)"],
+                      ["fiber_g", "Fiber (g)"],
+                    ].map(([k, label]) => (
+                      <div className="field" key={k}>
+                        <label>{label}</label>
+                        <input
+                          type="number"
+                          value={targets[k]}
+                          onChange={(e) => setTargets({ ...targets, [k]: +e.target.value })}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="field">
+                    <label>Preferences</label>
+                    <textarea rows={2} value={prefs} onChange={(e) => setPrefs(e.target.value)} />
+                  </div>
+                  <button className="btn" disabled={!ready || busy} onClick={run}>
+                    {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Add Supabase keys in Setup first"}
+                  </button>
+                </div>
 
-        {tab === "box" && (
-          <>
-            {box.length === 0 && <div className="card">No recipes yet. Go make one.</div>}
-            {box.map((r) => (
-              <RecipeCard key={r.id} r={r} />
-            ))}
+                {logLines.length > 0 && (
+                  <div className="card">
+                    <h3 style={{ marginTop: 0 }}>Kitchen pass</h3>
+                    <div className="log" ref={logRef}>{logLines.join("\n")}</div>
+                  </div>
+                )}
+
+                {current && <RecipeCard r={current} onKeep={keep} keepLabel="Add to the box" />}
+              </>
+            )}
+
+            {tab === "box" && (
+              <>
+                {box.length === 0 && <div className="card">No recipes yet. Go make one.</div>}
+                {box.map((r) => (
+                  <RecipeCard key={r.id} r={r} />
+                ))}
+              </>
+            )}
           </>
         )}
       </div>
     </div>
+  );
+}
+
+function LockCard({ onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setErr("");
+    setBusy(true);
+    try {
+      const r = await fetch("/api/claude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-app-password": pw },
+        body: JSON.stringify({ auth_check: true }),
+      });
+      if (r.ok) {
+        sessionStorage.setItem("rb_pw", pw);
+        onUnlock();
+      } else {
+        setErr("That password didn't work.");
+      }
+    } catch {
+      setErr("Couldn't reach the server. Try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="card" onSubmit={submit} style={{ maxWidth: 380 }}>
+      <h3 style={{ marginTop: 0 }}>This box is locked</h3>
+      <p style={{ fontSize: 13, color: "#8a7a5c" }}>Enter the password to come in.</p>
+      {err && <div className="err">{err}</div>}
+      <div className="field">
+        <label>Password</label>
+        <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} autoFocus />
+      </div>
+      <button className="btn" type="submit" disabled={busy || !pw}>
+        {busy ? "Checking…" : "Unlock"}
+      </button>
+    </form>
   );
 }
 
