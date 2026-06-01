@@ -8,11 +8,14 @@ blind palatability judge approves on taste alone so the food stays edible.
 
 Per request the app runs this pipeline:
 
-1. **Generator** (Claude) proposes a recipe: `{name, usdaQuery, grams}` per
-   ingredient plus steps. Grams are always the cooked weight, and the USDA query
-   targets a cooked entry, so there is no raw to cooked yield math.
+1. **Generator** (Claude) proposes a recipe: per ingredient a display name, a USDA
+   search phrase, a `match` term (the food word that must appear in the matched
+   USDA entry), and a cooked gram weight, plus steps. Grams are always the cooked
+   weight and the query targets a cooked entry, so there is no raw to cooked math.
 2. **Grounding** (code) sends those ingredients to a Supabase edge function that
-   queries USDA, fetches per 100g macros, and returns authoritative totals.
+   queries USDA, verifies each hit actually contains the `match` term (so edamame
+   can't silently resolve to asparagus), fetches per 100g macros, and returns
+   authoritative totals.
 3. **Reconcile**: if totals are off target, loop back to the Generator with the
    real shortfall (cap 4 rounds).
 4. **Palatability judge** (a separate Claude call given no macro targets) passes
@@ -27,11 +30,13 @@ number it could be seduced into chasing. That split is the whole point.
 
 - React + Vite single page app (`src/App.jsx`).
 - Supabase Postgres table `recipes` for storage, plus an edge function
-  `usda-ground` that does all USDA work server side.
-- A small server-side proxy for the Anthropic API (`server/claude.js`), exposed
-  two ways from one shared handler: a Vite dev middleware for `npm run dev`, and
-  a Netlify function (`netlify/functions/claude.mjs`) for production. Model:
-  `claude-sonnet-4-6`. The Anthropic key never reaches the browser.
+  `usda-ground` that does all USDA work server side (search, match validation,
+  macro math).
+- A small server-side proxy (`server/claude.js`) for the recipe engine, exposed
+  two ways from one shared handler: a Vite dev middleware for `npm run dev`, and a
+  Netlify function (`netlify/functions/claude.mjs`) for production. It holds the
+  Anthropic key, fixes the model (`claude-sonnet-4-6`), and enforces the app
+  password. None of that reaches the browser.
 
 ## Prerequisites
 
@@ -45,24 +50,30 @@ number it could be seduced into chasing. That split is the whole point.
 ```bash
 npm install
 cp .env.example .env
-# then edit .env and set ANTHROPIC_API_KEY=sk-ant-...
+# then edit .env: set ANTHROPIC_API_KEY, and APP_PASSWORD if you want the gate
 npm run dev
 ```
 
-Open the printed localhost URL and go to **Make a recipe**. Supabase URL and
-anon key are prefilled from `.env` (public values). The Anthropic key is read
-server side by the dev proxy, so there is nothing to paste in the browser.
+Open the printed localhost URL. Supabase URL and anon key are prefilled from
+`.env` (public values). The Anthropic key and password are read server side by
+the dev proxy, so there is nothing to paste in the browser.
 
-### Where each key lives
+## The password gate
 
-- **Supabase URL + anon key**: public client values, safe in the browser. Access
-  is governed by row-level security, not by hiding the key. Prefilled in
-  `.env.example`.
-- **Anthropic key** (`ANTHROPIC_API_KEY`, no `VITE_` prefix): server side only.
-  Used by the Vite dev proxy locally and the Netlify function in production. It
-  is never bundled into client code.
-- **USDA key** (`USDA_API_KEY`): a secret on the Supabase edge function. It never
-  touches the browser. See open items.
+A shared password keeps random visitors from burning your Anthropic spend.
+
+- Set `APP_PASSWORD` (server-side env var). The app shows a lock screen, and the
+  `/api/claude` proxy refuses to call Anthropic without the right password. The
+  check is server side, so it actually protects the calls, not just the screen.
+- Leave `APP_PASSWORD` blank and there is no gate (handy for local dev).
+- The entered password is kept in the browser session only and sent with each
+  request for the server to verify.
+
+What it does not cover: the `recipes` table is still reachable directly with the
+public anon key (read and insert), so the gate deters casual visitors but is not
+a hard lock on the database. Tightening that means real auth or routing writes
+through the server with the service role key. Worth doing if this goes beyond a
+personal tool.
 
 ## Deploy to Netlify
 
@@ -71,31 +82,27 @@ server side by the dev proxy, so there is nothing to paste in the browser.
 these environment variables in the Netlify UI (Site settings > Environment
 variables):
 
-- `ANTHROPIC_API_KEY` (required; server side, powers the recipe proxy).
+- `ANTHROPIC_API_KEY` (required; powers the recipe proxy).
+- `APP_PASSWORD` (optional; turns on the lock screen).
 - `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (optional; the app falls back to
-  the public defaults baked into the code if these are unset).
-
-The browser calls `/api/claude`, which Netlify routes to
-`netlify/functions/claude.mjs`. The key stays on the server.
+  the public defaults baked into the code if unset).
 
 ## Open items / known rough edges
 
 1. **Set the USDA secret on Supabase.** The edge function reads `USDA_API_KEY`
-   and falls back to `DEMO_KEY` (about 30 requests/hour, which will choke
-   immediately). This must be a **Supabase edge function secret**, not a GitHub
-   secret: Supabase dashboard > project `nwgxyytowbluuykbdcfc` > Edge Functions
-   > Secrets > `USDA_API_KEY`. Or via CLI:
-   `supabase secrets set USDA_API_KEY=... --project-ref nwgxyytowbluuykbdcfc`.
+   and falls back to `DEMO_KEY` (about 30 requests/hour, which chokes fast). This
+   must be a **Supabase edge function secret**, not a GitHub secret: dashboard >
+   project `nwgxyytowbluuykbdcfc` > Edge Functions > Secrets > `USDA_API_KEY`. Or
+   via CLI: `supabase secrets set USDA_API_KEY=... --project-ref nwgxyytowbluuykbdcfc`.
    Free key: https://fdc.nal.usda.gov/api-key-signup.html
-2. **RLS is permissive.** The `recipes` table has row-level security enabled with
-   a policy that allows public read and insert, because the app authenticates
-   with only the anon key (no user login). Fine for a private deploy. Add real
-   auth (Supabase Auth) and scope rows to the signed-in user before this is
-   shared.
-3. **Ingredient matching takes the first cooked hit** from USDA search. Worked in
-   tests, but USDA search is fuzzy and a top hit is occasionally a branded or
-   lunchmeat item. A disambiguation step (show the match, let the user confirm or
-   swap) is the next improvement. Watch soba and edamame on the first real run.
+2. **RLS is permissive.** The `recipes` table allows public read and insert via
+   the anon key (no user login). Fine for a private deploy; add real auth before
+   sharing it.
+3. **Ingredient matching** now validates that the chosen USDA entry contains the
+   Generator's `match` term and searches Foundation, SR Legacy, and Survey
+   (FNDDS). If nothing matches, that ingredient fails loudly instead of resolving
+   to the wrong food. A curated table of staple foods mapped to known-good FDC IDs
+   is the natural next layer for Charlie's regulars.
 
 ## Demo parameters
 

@@ -1,18 +1,10 @@
-import { callAnthropic } from "../../server/claude.js";
+import { handleClaudeRequest } from "../../server/claude.js";
 
-// Netlify Function (v2). Holds ANTHROPIC_API_KEY server-side and forwards to
-// the Anthropic API. The browser calls /api/claude (see netlify.toml redirect).
+// Netlify Function (v2). Enforces the app password and proxies to Anthropic,
+// both server-side. The browser calls /api/claude (see netlify.toml redirect).
 export default async (req) => {
   if (req.method !== "POST") {
     return json({ error: { message: "Method not allowed" } }, 405);
-  }
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return json(
-      { error: { message: "ANTHROPIC_API_KEY is not set on the server." } },
-      500
-    );
   }
 
   let body;
@@ -22,8 +14,10 @@ export default async (req) => {
     body = {};
   }
 
+  const password = req.headers.get("x-app-password") || "";
+
   try {
-    const { status, data } = await callAnthropic(body, apiKey);
+    const { status, data } = await handleClaudeRequest(body, password, process.env);
     return json(data, status);
   } catch (e) {
     return json({ error: { message: String(e?.message ?? e) } }, 502);
