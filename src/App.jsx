@@ -37,9 +37,15 @@ const DEFAULT_TARGETS = {
 const DEFAULT_PREFS =
   "Loves umami flavors. Skinless boneless chicken breast is a workhorse protein. No hard dislikes or allergies. Avoid burying a dish in any single garnish to hit a number, balance is the point.";
 
-// Public client defaults; can be overridden by env vars or the Setup tab.
-const ENV_SB_URL = import.meta.env.VITE_SUPABASE_URL || "https://nwgxyytowbluuykbdcfc.supabase.co";
-const ENV_SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+// Supabase connection. These are PUBLIC client values for this one project:
+// the publishable key is meant to live in the browser (access is governed by
+// row-level security, not by hiding it). Baked in so there's nothing to paste
+// and no env var that could be set to the wrong (secret) key by mistake.
+// An env var can still override for a different project/deploy.
+const SB = {
+  url: import.meta.env.VITE_SUPABASE_URL || "https://nwgxyytowbluuykbdcfc.supabase.co",
+  key: import.meta.env.VITE_SUPABASE_ANON_KEY || "sb_publishable_MF7iftdZykPrfelnVnJHew_DSuyVLJ1",
+};
 
 const appPassword = () =>
   (typeof sessionStorage !== "undefined" && sessionStorage.getItem("rb_pw")) || "";
@@ -196,8 +202,7 @@ async function loadRecipes(sb) {
 //  UI
 // ─────────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [sbUrl, setSbUrl] = useState(ENV_SB_URL);
-  const [sbKey, setSbKey] = useState(ENV_SB_KEY);
+  const sb = SB;
   const [targets, setTargets] = useState(DEFAULT_TARGETS);
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
 
@@ -236,8 +241,7 @@ export default function App() {
     })();
   }, []);
 
-  const sb = { url: sbUrl.replace(/\/$/, ""), key: sbKey };
-  const ready = sbUrl && sbKey;
+  const ready = Boolean(sb.url && sb.key);
 
   async function refreshBox() {
     try {
@@ -429,35 +433,14 @@ export default function App() {
         ) : (
           <>
             <div className="tabs">
-              {["make", "box", "setup"].map((t) => (
+              {["make", "box"].map((t) => (
                 <button key={t} className={`tab ${tab === t ? "on" : ""}`} onClick={() => { setTab(t); if (t === "box") refreshBox(); }}>
-                  {t === "make" ? "Make a recipe" : t === "box" ? "The box" : "Setup"}
+                  {t === "make" ? "Make a recipe" : "The box"}
                 </button>
               ))}
             </div>
 
             {err && <div className="err">{err}</div>}
-
-            {tab === "setup" && (
-              <div className="card">
-                <h3 style={{ marginTop: 0 }}>Keys & connection</h3>
-                <p style={{ fontSize: 13, color: "#8a7a5c" }}>
-                  Connection settings for this session only; nothing is persisted.
-                  The Supabase anon key is safe for client use behind row-level
-                  security. Your USDA key lives server-side in the edge function (the
-                  USDA_API_KEY secret), and your Anthropic key and app password live
-                  server-side in the recipe proxy. None of those touch the browser.
-                </p>
-                <div className="field">
-                  <label>Supabase project URL</label>
-                  <input value={sbUrl} onChange={(e) => setSbUrl(e.target.value)} />
-                </div>
-                <div className="field">
-                  <label>Supabase anon key</label>
-                  <input value={sbKey} onChange={(e) => setSbKey(e.target.value)} placeholder="paste anon/publishable key" />
-                </div>
-              </div>
-            )}
 
             {tab === "make" && (
               <>
@@ -485,7 +468,7 @@ export default function App() {
                     <textarea rows={2} value={prefs} onChange={(e) => setPrefs(e.target.value)} />
                   </div>
                   <button className="btn" disabled={!ready || busy} onClick={run}>
-                    {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Add Supabase keys in Setup first"}
+                    {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Supabase not configured"}
                   </button>
                 </div>
 
