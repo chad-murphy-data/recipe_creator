@@ -2,7 +2,18 @@
   command = "npm run build"
   publish = "dist"
 
-# Single-page app: send unknown routes to index.html.
+[functions]
+  directory = "netlify/functions"
+
+# Route the browser's /api/claude to the serverless proxy.
+# This must come before the SPA fallback below.
+[[redirects]]
+  from = "/api/claude"
+  to = "/.netlify/functions/claude"
+  status = 200
+  force = true
+
+# Single-page app: send everything else to index.html.
 [[redirects]]
   from = "/*"
   to = "/index.html"

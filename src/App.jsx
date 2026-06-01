@@ -12,9 +12,12 @@ import React, { useState, useEffect, useRef } from "react";
 //    4. Palatability -> blind judge (no macros) approves or kicks back
 //    5. Re-ground    -> recompute after any taste edit; macros can't silently drift
 //    6. Save         -> Supabase
+//
+//  The Generator and judge run through /api/claude, a server-side proxy that
+//  holds the Anthropic key (Vite dev middleware locally, Netlify function in
+//  production). The key never reaches the browser.
 // ─────────────────────────────────────────────────────────────────────────
 
-const SONNET = "claude-sonnet-4-20250514";
 const MAX_MACRO_ROUNDS = 4;
 const MAX_TASTE_ROUNDS = 3;
 
@@ -34,7 +37,6 @@ const DEFAULT_PREFS =
 // Public client defaults; can be overridden by env vars or the Setup tab.
 const ENV_SB_URL = import.meta.env.VITE_SUPABASE_URL || "https://nwgxyytowbluuykbdcfc.supabase.co";
 const ENV_SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
-const ENV_ANTHROPIC_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY || "";
 
 // ── USDA grounding via Supabase edge function (server-side, no CORS/sandbox issue) ──
 async function groundViaEdge(sb, ingredients) {
@@ -52,30 +54,17 @@ async function groundViaEdge(sb, ingredients) {
   return d; // { grounded, total }
 }
 
-// ── Anthropic API helper ─────────────────────────────────────────────────
-// The key is pasted in-session (Setup tab) or supplied via VITE_ANTHROPIC_API_KEY.
-// "anthropic-dangerous-direct-browser-access" lets the call run straight from the
-// browser, which is fine for a private single-user demo. For a real/public deploy,
-// front this with a serverless function that holds the key server-side instead.
-async function callClaude(system, userContent, apiKey) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+// ── Recipe engine (Generator + judge) via the server-side Anthropic proxy ──
+// See server/claude.js. The key and model live on the server, not here.
+async function callClaude(system, userContent) {
+  const response = await fetch("/api/claude", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: SONNET,
-      max_tokens: 1000,
-      system,
-      messages: [{ role: "user", content: userContent }],
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, user: userContent }),
   });
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data?.error?.message || `Anthropic API error (${response.status})`);
+    throw new Error(data?.error?.message || `Recipe engine error (${response.status})`);
   }
   const text = (data.content || [])
     .filter((b) => b.type === "text")
@@ -90,7 +79,7 @@ function parseJSON(text) {
 }
 
 // ── Generator agent ────────────────────────────────────────────────────────
-async function generateRecipe(targets, prefs, feedback, apiKey) {
+async function generateRecipe(targets, prefs, feedback) {
   const system = `You design dinner recipes for ONE serving that hit precise macro targets.
 
 HARD RULES:
@@ -112,11 +101,11 @@ Respond ONLY with JSON, no prose, no backticks:
 Preferences: ${prefs}
 ${feedback ? `\nREVISION NEEDED:\n${feedback}` : ""}`;
 
-  return parseJSON(await callClaude(system, user, apiKey));
+  return parseJSON(await callClaude(system, user));
 }
 
 // ── Palatability judge (blind to macros) ─────────────────────────────────
-async function judgePalatability(recipe, apiKey) {
+async function judgePalatability(recipe) {
   const system = `You are a discerning home cook. You will see a recipe — title, ingredients with amounts, and steps. You do NOT know any nutrition targets and you do not care about them.
 
 Answer one question: would a normal person enjoy eating this, and is every ingredient in a sane quantity? Flag anything that looks off — an ingredient in absurd amounts, a bizarre combination, something that would taste bad or unbalanced.
@@ -130,7 +119,7 @@ ${recipe.ingredients.map((i) => `- ${i.grams}g ${i.name}`).join("\n")}
 Steps:
 ${recipe.steps.map((s, n) => `${n + 1}. ${s}`).join("\n")}`;
 
-  return parseJSON(await callClaude(system, user, apiKey));
+  return parseJSON(await callClaude(system, user));
 }
 
 // ── Grounding: delegate to edge function, then log results ───────────────
@@ -188,7 +177,6 @@ async function loadRecipes(sb) {
 export default function App() {
   const [sbUrl, setSbUrl] = useState(ENV_SB_URL);
   const [sbKey, setSbKey] = useState(ENV_SB_KEY);
-  const [anthropicKey, setAnthropicKey] = useState(ENV_ANTHROPIC_KEY);
   const [targets, setTargets] = useState(DEFAULT_TARGETS);
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
 
@@ -206,7 +194,7 @@ export default function App() {
   }, [logLines]);
 
   const sb = { url: sbUrl.replace(/\/$/, ""), key: sbKey };
-  const ready = sbUrl && sbKey && anthropicKey;
+  const ready = sbUrl && sbKey;
 
   async function refreshBox() {
     try {
@@ -230,7 +218,7 @@ export default function App() {
       // macro reconciliation loop
       for (let round = 1; round <= MAX_MACRO_ROUNDS; round++) {
         log(`Generator — round ${round}…`);
-        recipe = await generateRecipe(targets, prefs, feedback, anthropicKey);
+        recipe = await generateRecipe(targets, prefs, feedback);
         log(`Proposed: "${recipe.title}". Grounding in USDA…`);
         ({ grounded, total } = await groundRecipe(recipe, sb, log));
         log(
@@ -255,7 +243,7 @@ export default function App() {
       let verdict = { passes: true, note: "" };
       for (let t = 1; t <= MAX_TASTE_ROUNDS; t++) {
         log(`Palatability judge (blind) — round ${t}…`);
-        verdict = await judgePalatability(recipe, anthropicKey);
+        verdict = await judgePalatability(recipe);
         if (verdict.passes) {
           log(`✓ Taste check passed. ${verdict.note || ""}`);
           break;
@@ -269,8 +257,7 @@ export default function App() {
         recipe = await generateRecipe(
           targets,
           prefs,
-          `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem while keeping macros on target.`,
-          anthropicKey
+          `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem while keeping macros on target.`
         );
         log(`Revised for taste: "${recipe.title}". Re-grounding…`);
         ({ grounded, total } = await groundRecipe(recipe, sb, log));
@@ -387,13 +374,12 @@ export default function App() {
           <div className="card">
             <h3 style={{ marginTop: 0 }}>Keys & connection</h3>
             <p style={{ fontSize: 13, color: "#8a7a5c" }}>
-              Keys are kept in memory for this session only — nothing is persisted.
-              The Supabase anon key is safe for client use behind row-level security.
-              Your USDA key lives server-side in the edge function (set as the
-              USDA_API_KEY secret in the dashboard) and never touches the browser.
-              The Anthropic key is used to call the Generator and the taste judge
-              directly from your browser; for a public deploy, proxy it through a
-              serverless function instead.
+              Connection settings for this session only; nothing is persisted.
+              The Supabase anon key is safe for client use behind row-level
+              security. Your USDA key lives server-side in the edge function (the
+              USDA_API_KEY secret), and your Anthropic key lives server-side in
+              the recipe proxy (the ANTHROPIC_API_KEY env var). Neither touches
+              the browser.
             </p>
             <div className="field">
               <label>Supabase project URL</label>
@@ -402,10 +388,6 @@ export default function App() {
             <div className="field">
               <label>Supabase anon key</label>
               <input value={sbKey} onChange={(e) => setSbKey(e.target.value)} placeholder="paste anon/publishable key" />
-            </div>
-            <div className="field">
-              <label>Anthropic API key</label>
-              <input type="password" value={anthropicKey} onChange={(e) => setAnthropicKey(e.target.value)} placeholder="sk-ant-…" />
             </div>
           </div>
         )}
@@ -436,7 +418,7 @@ export default function App() {
                 <textarea rows={2} value={prefs} onChange={(e) => setPrefs(e.target.value)} />
               </div>
               <button className="btn" disabled={!ready || busy} onClick={run}>
-                {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Add keys in Setup first"}
+                {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Add Supabase keys in Setup first"}
               </button>
             </div>
 

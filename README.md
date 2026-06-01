@@ -28,7 +28,10 @@ number it could be seduced into chasing. That split is the whole point.
 - React + Vite single page app (`src/App.jsx`).
 - Supabase Postgres table `recipes` for storage, plus an edge function
   `usda-ground` that does all USDA work server side.
-- Anthropic API for the Generator and the judge (`claude-sonnet-4-20250514`).
+- A small server-side proxy for the Anthropic API (`server/claude.js`), exposed
+  two ways from one shared handler: a Vite dev middleware for `npm run dev`, and
+  a Netlify function (`netlify/functions/claude.mjs`) for production. Model:
+  `claude-sonnet-4-6`. The Anthropic key never reaches the browser.
 
 ## Prerequisites
 
@@ -41,50 +44,54 @@ number it could be seduced into chasing. That split is the whole point.
 
 ```bash
 npm install
-cp .env.example .env      # Supabase URL + anon key are prefilled (public values)
+cp .env.example .env
+# then edit .env and set ANTHROPIC_API_KEY=sk-ant-...
 npm run dev
 ```
 
-Open the printed localhost URL. Go to the **Setup** tab and paste your Anthropic
-API key (or set `VITE_ANTHROPIC_API_KEY` in `.env`). Then **Make a recipe**.
+Open the printed localhost URL and go to **Make a recipe**. Supabase URL and
+anon key are prefilled from `.env` (public values). The Anthropic key is read
+server side by the dev proxy, so there is nothing to paste in the browser.
 
-### Keys and where they live
+### Where each key lives
 
 - **Supabase URL + anon key**: public client values, safe in the browser. Access
   is governed by row-level security, not by hiding the key. Prefilled in
   `.env.example`.
-- **Anthropic key**: a real secret. Paste it in the Setup tab (kept in memory for
-  the session only, never persisted). If you put it in `.env` for convenience,
-  remember that `vite build` would bake it into the public bundle, so do not do
-  that for a shared deploy. Use a serverless proxy instead (see below).
-- **USDA key**: lives server side as the `USDA_API_KEY` secret on the edge
-  function. It never touches the browser. See open items.
+- **Anthropic key** (`ANTHROPIC_API_KEY`, no `VITE_` prefix): server side only.
+  Used by the Vite dev proxy locally and the Netlify function in production. It
+  is never bundled into client code.
+- **USDA key** (`USDA_API_KEY`): a secret on the Supabase edge function. It never
+  touches the browser. See open items.
 
 ## Deploy to Netlify
 
-`netlify.toml` is included (build `npm run build`, publish `dist`, SPA redirect).
-Connect the repo, set environment variables in the Netlify UI:
+`netlify.toml` is included: build `npm run build`, publish `dist`, route
+`/api/claude` to the function, and an SPA fallback. Connect the repo, then set
+these environment variables in the Netlify UI (Site settings > Environment
+variables):
 
-- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (safe to expose).
+- `ANTHROPIC_API_KEY` (required; server side, powers the recipe proxy).
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (optional; the app falls back to
+  the public defaults baked into the code if these are unset).
 
-For the Anthropic call on a public deploy, do not ship the key in the bundle.
-Add a small serverless function (Netlify Functions) that holds
-`ANTHROPIC_API_KEY` server side and forwards to `api.anthropic.com`, then point
-the frontend at that function. The current build calls Anthropic directly from
-the browser with a pasted key, which is fine for a private single-user demo but
-not for a public URL.
+The browser calls `/api/claude`, which Netlify routes to
+`netlify/functions/claude.mjs`. The key stays on the server.
 
 ## Open items / known rough edges
 
-1. **Set the USDA secret.** The edge function reads `USDA_API_KEY` and falls back
-   to `DEMO_KEY` (about 30 requests/hour, which will choke immediately). Set the
-   real key in the Supabase dashboard: project `nwgxyytowbluuykbdcfc` ->
-   Edge Functions -> Secrets -> `USDA_API_KEY`. Free key:
-   https://fdc.nal.usda.gov/api-key-signup.html
+1. **Set the USDA secret on Supabase.** The edge function reads `USDA_API_KEY`
+   and falls back to `DEMO_KEY` (about 30 requests/hour, which will choke
+   immediately). This must be a **Supabase edge function secret**, not a GitHub
+   secret: Supabase dashboard > project `nwgxyytowbluuykbdcfc` > Edge Functions
+   > Secrets > `USDA_API_KEY`. Or via CLI:
+   `supabase secrets set USDA_API_KEY=... --project-ref nwgxyytowbluuykbdcfc`.
+   Free key: https://fdc.nal.usda.gov/api-key-signup.html
 2. **RLS is permissive.** The `recipes` table has row-level security enabled with
    a policy that allows public read and insert, because the app authenticates
-   with only the anon key (no user login). Fine for a private demo. Add real auth
-   and per-user rows before this is more than that.
+   with only the anon key (no user login). Fine for a private deploy. Add real
+   auth (Supabase Auth) and scope rows to the signed-in user before this is
+   shared.
 3. **Ingredient matching takes the first cooked hit** from USDA search. Worked in
    tests, but USDA search is fuzzy and a top hit is occasionally a branded or
    lunchmeat item. A disambiguation step (show the match, let the user confirm or
