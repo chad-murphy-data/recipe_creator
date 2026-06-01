@@ -89,7 +89,16 @@ async function callClaude(system, userContent) {
 
 function parseJSON(text) {
   const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+  try {
+    return JSON.parse(clean);
+  } catch {
+    // Most often a truncated response. Give an actionable message instead of
+    // the cryptic "Unexpected end of JSON input".
+    const preview = clean.slice(0, 120).replace(/\s+/g, " ");
+    throw new Error(
+      `The recipe engine returned text that wasn't valid JSON (likely cut off). Try again. Starts with: "${preview}…"`
+    );
+  }
 }
 
 // ── Generator agent ────────────────────────────────────────────────────────
