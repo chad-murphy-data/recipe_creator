@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { solvePortions, offTarget, TOL } from "./solver.js";
 
 // ─────────────────────────────────────────────────────────────────────────
 //  Charlie's Recipe Box
@@ -6,23 +7,25 @@ import React, { useState, useEffect, useRef } from "react";
 //  by a blind palatability judge. Saved to Supabase.
 //
 //  Pipeline per request:
-//    1. Generator    -> proposes recipe w/ USDA query + match term + cooked grams
-//    2. Grounding    -> code queries USDA, validates the match, computes macros
-//    3. Reconcile    -> off-target? loop back to Generator w/ real shortfall
-//    4. Palatability -> blind judge (no macros) approves or kicks back
-//    5. Re-ground    -> recompute after any taste edit; macros can't silently drift
-//    6. Save         -> Supabase
+//    1. Generator    -> proposes a dish: ingredients (w/ USDA query, match, role)
+//                       + rough grams + steps. Grams are a starting point.
+//    2. Grounding    -> code queries USDA, validates the match, gets per-100g macros
+//    3. Solve        -> code computes the exact gram weights that hit the targets,
+//                       within sane per-ingredient bounds (the precision engine).
+//    4. Swap (only)  -> if NO portioning can hit the targets, the ingredient SET
+//                       is wrong: ask the model to swap one in, then re-ground.
+//    5. Palatability -> blind judge (no macros) approves or kicks back
+//    6. Re-solve     -> after any taste edit, re-ground and re-solve so macros
+//                       can't silently drift
+//    7. Save         -> Supabase
 //
-//  The Generator and judge run through /api/claude, a server-side proxy that
-//  holds the Anthropic key and enforces the app password. Neither reaches the
-//  browser.
+//  Macros are never the model's job. The model designs the dish; code owns the
+//  numbers. The Generator and judge run through /api/claude, a server-side proxy
+//  that holds the Anthropic key and enforces the app password.
 // ─────────────────────────────────────────────────────────────────────────
 
-const MAX_MACRO_ROUNDS = 4;
+const MAX_SWAP_ROUNDS = 4;
 const MAX_TASTE_ROUNDS = 3;
-
-// macro tolerances (per serving)
-const TOL = { calories: 25, protein_g: 4, carbs_g: 8, fiber_g: 2 };
 
 const DEFAULT_TARGETS = {
   calories: 535,
@@ -83,21 +86,25 @@ function parseJSON(text) {
 }
 
 // ── Generator agent ────────────────────────────────────────────────────────
+// The model designs the DISH. It does not have to nail the macros: code solves
+// the exact gram weights afterward. Its grams are just a sensible starting point,
+// and its "role" tags tell the solver how far each ingredient may be adjusted.
 async function generateRecipe(targets, prefs, feedback) {
-  const system = `You design dinner recipes for ONE serving that hit precise macro targets.
+  const system = `You design dinner recipes for ONE serving. A separate program will fine-tune the exact gram weights to hit macro targets, so you do not need to nail the numbers. Your job is a real, appealing, balanced dish with the right KINDS and rough amounts of food.
 
 HARD RULES:
-- For every ingredient, give a COOKED gram weight (cooked, not raw).
+- For every ingredient, give a COOKED gram weight (cooked, not raw) as a reasonable starting amount.
 - For every ingredient, propose a USDA FoodData Central search phrase that will match a COOKED entry (e.g. "chicken breast meat only cooked roasted", "broccoli cooked boiled", "brown rice cooked"). Prefer cooked/roasted/boiled forms.
-- For every ingredient, also give "match": the identifying food word(s) the correct USDA entry MUST contain. Use the distinctive food noun, not preparation words. Examples: "shelled edamame, cooked" -> "edamame"; "low-sodium soy sauce" -> "soy sauce"; "brown rice, cooked" -> "brown rice". Be specific for proteins, grains, and produce; a general word is fine for a minor seasoning (e.g. "vinegar").
-- Do NOT use an absurd quantity of any single ingredient to hit a number. No garnish mountains.
-- Real, appealing, balanced food a person would actually want to eat.
+- For every ingredient, give "match": the identifying food word(s) the correct USDA entry MUST contain. Use the distinctive food noun, not preparation words. Examples: "shelled edamame, cooked" -> "edamame"; "low-sodium soy sauce" -> "soy sauce". Be specific for proteins, grains, and produce; a general word is fine for a minor seasoning (e.g. "vinegar").
+- For every ingredient, give "role": one of "protein", "carb", "vegetable", "legume", "fat", "seasoning". This controls how much the amount may be adjusted, so be accurate (oils/butter = "fat"; sauces/spices/aromatics = "seasoning").
+- Include enough of a clear protein source, a clear carb source, and produce that the targets are reachable by adjusting amounts. (To reach ${targets.protein_g}g protein you need a real protein anchor; to reach ${targets.fiber_g}g fiber you need beans/whole grains/veg.)
+- Real, appealing food a person would actually want to eat. No garnish mountains.
 
 Respond ONLY with JSON, no prose, no backticks:
 {
   "title": "string",
   "ingredients": [
-    {"name":"display name","usdaQuery":"search phrase for a cooked entry","match":"identifying food word(s) that must appear in the USDA entry","grams":number}
+    {"name":"display name","usdaQuery":"search phrase for a cooked entry","match":"identifying food word(s) that must appear in the USDA entry","role":"protein|carb|vegetable|legume|fat|seasoning","grams":number}
   ],
   "steps": ["step 1","step 2"]
 }`;
@@ -128,27 +135,36 @@ ${recipe.steps.map((s, n) => `${n + 1}. ${s}`).join("\n")}`;
 }
 
 // ── Grounding: delegate to edge function, then log results ───────────────
+// We carry the model's "role" onto each grounded ingredient so the solver knows
+// how far it may adjust each amount (the edge function doesn't echo role back).
 async function groundRecipe(recipe, sb, log) {
   log(`  Sending ${recipe.ingredients.length} ingredients to USDA grounding…`);
   const { grounded, total } = await groundViaEdge(
     sb,
     recipe.ingredients.map((i) => ({ name: i.name, usdaQuery: i.usdaQuery, grams: i.grams, match: i.match }))
   );
+  grounded.forEach((g, idx) => {
+    if (recipe.ingredients[idx]) g.role = recipe.ingredients[idx].role;
+  });
   for (const g of grounded) log(`    → ${g.name}: ${g.fdcDescription} (FDC ${g.fdcId})`);
   return { grounded, total };
 }
 
-function offTarget(total, targets) {
-  const misses = [];
-  if (Math.abs(total.kcal - targets.calories) > TOL.calories)
-    misses.push(`calories ${total.kcal.toFixed(0)} vs target ${targets.calories}`);
-  if (Math.abs(total.protein - targets.protein_g) > TOL.protein_g)
-    misses.push(`protein ${total.protein.toFixed(1)}g vs target ${targets.protein_g}g`);
-  if (Math.abs(total.carbs - targets.carbs_g) > TOL.carbs_g)
-    misses.push(`carbs ${total.carbs.toFixed(1)}g vs target ${targets.carbs_g}g`);
-  if (total.fiber < targets.fiber_g - TOL.fiber_g)
-    misses.push(`fiber ${total.fiber.toFixed(1)}g below target ${targets.fiber_g}g`);
-  return misses;
+// Apply solved gram weights back onto the grounded ingredients so saved/displayed
+// amounts and per-ingredient contributions reflect the final portions.
+function applyGrams(grounded, grams) {
+  return grounded.map((g, i) => {
+    const f = (grams[i] ?? 0) / 100;
+    const p = g.per100g || {};
+    return {
+      ...g,
+      grams_cooked: grams[i],
+      contributes: {
+        kcal: (p.kcal || 0) * f, protein: (p.protein || 0) * f, fat: (p.fat || 0) * f,
+        carbs: (p.carbs || 0) * f, fiber: (p.fiber || 0) * f,
+      },
+    };
+  });
 }
 
 // ── Supabase (REST) ────────────────────────────────────────────────────────
@@ -240,37 +256,50 @@ export default function App() {
       let feedback = "";
       let recipe = null;
       let grounded = null;
-      let total = null;
+      let solved = null;
 
-      // macro reconciliation loop
-      for (let round = 1; round <= MAX_MACRO_ROUNDS; round++) {
-        log(`Generator — round ${round}…`);
+      // ── Generate -> ground -> SOLVE. Code owns the portions. We only loop
+      //    back to the model when the ingredient SET can't hit the targets at
+      //    any portioning (then it swaps an ingredient, not re-guesses grams).
+      for (let round = 1; round <= MAX_SWAP_ROUNDS; round++) {
+        log(round === 1 ? `Generator…` : `Generator — swapping an ingredient (round ${round})…`);
         recipe = await generateRecipe(targets, prefs, feedback);
         log(`Proposed: "${recipe.title}". Grounding in USDA…`);
-        ({ grounded, total } = await groundRecipe(recipe, sb, log));
+        ({ grounded } = await groundRecipe(recipe, sb, log));
+
+        log(`Solving exact portions…`);
+        solved = solvePortions(grounded, targets);
+        for (const c of solved.changes) {
+          if (c.from !== c.to) log(`    · ${c.name}: ${c.from}g → ${c.to}g`);
+        }
         log(
-          `Grounded totals: ${total.kcal.toFixed(0)} kcal · ${total.protein.toFixed(
+          `Solved totals: ${solved.total.kcal.toFixed(0)} kcal · ${solved.total.protein.toFixed(
             1
-          )}g P · ${total.carbs.toFixed(1)}g C · ${total.fiber.toFixed(1)}g fiber`
+          )}g P · ${solved.total.carbs.toFixed(1)}g C · ${solved.total.fiber.toFixed(1)}g fiber`
         );
-        const misses = offTarget(total, targets);
-        if (!misses.length) {
-          log(`✓ Macros within tolerance.`);
+
+        if (solved.withinTolerance) {
+          log(`✓ Macros hit within tolerance.`);
           break;
         }
-        log(`✗ Off target: ${misses.join("; ")}`);
-        feedback = `The grounded macros were off: ${misses.join(
+        log(`✗ This ingredient set can't hit target: ${solved.misses.join("; ")}`);
+        feedback = `Code adjusted the portions as far as it sensibly could and STILL could not hit the targets: ${solved.misses.join(
           "; "
-        )}. Adjust ingredient amounts (or swap an ingredient) to close the gap. Keep it appetizing.`;
-        if (round === MAX_MACRO_ROUNDS)
-          log(`Reached macro round cap — proceeding with closest version.`);
+        )}. The amounts are not the problem; the ingredient SET is. Swap in or add an ingredient that fixes this (e.g. a leaner/denser protein for a protein gap, beans or whole grains for a fiber gap) and keep the dish appetizing. Do not just change numbers.`;
+        if (round === MAX_SWAP_ROUNDS)
+          log(`Reached swap cap — keeping the closest version (flagged below).`);
       }
 
-      // palatability loop (blind)
+      // Lock in the solved portions on the grounded ingredients.
+      grounded = applyGrams(grounded, solved.grams);
+      let total = solved.total;
+
+      // ── Palatability (blind). A taste fix re-grounds AND re-solves so the
+      //    macros can't silently drift off target.
       let verdict = { passes: true, note: "" };
       for (let t = 1; t <= MAX_TASTE_ROUNDS; t++) {
         log(`Palatability judge (blind) — round ${t}…`);
-        verdict = await judgePalatability(recipe);
+        verdict = await judgePalatability({ ...recipe, ingredients: grounded.map((g) => ({ name: g.name, grams: g.grams_cooked })) });
         if (verdict.passes) {
           log(`✓ Taste check passed. ${verdict.note || ""}`);
           break;
@@ -280,21 +309,25 @@ export default function App() {
           log(`Reached taste round cap — surfacing for your call.`);
           break;
         }
-        // taste-driven revision, then RE-GROUND so macros can't drift silently
         recipe = await generateRecipe(
           targets,
           prefs,
-          `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem while keeping macros on target.`
+          `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem. Amounts will be re-tuned automatically, so focus on the dish itself.`
         );
-        log(`Revised for taste: "${recipe.title}". Re-grounding…`);
-        ({ grounded, total } = await groundRecipe(recipe, sb, log));
+        log(`Revised for taste: "${recipe.title}". Re-grounding and re-solving…`);
+        ({ grounded } = await groundRecipe(recipe, sb, log));
+        solved = solvePortions(grounded, targets);
+        grounded = applyGrams(grounded, solved.grams);
+        total = solved.total;
+        if (!solved.withinTolerance) log(`  (note: ${solved.misses.join("; ")})`);
         log(
-          `Re-grounded: ${total.kcal.toFixed(0)} kcal · ${total.protein.toFixed(
+          `Re-solved: ${total.kcal.toFixed(0)} kcal · ${total.protein.toFixed(
             1
           )}g P · ${total.carbs.toFixed(1)}g C · ${total.fiber.toFixed(1)}g fiber`
         );
       }
 
+      const onTarget = solved.withinTolerance;
       const result = {
         title: recipe.title,
         servings: 1,
@@ -311,9 +344,11 @@ export default function App() {
         steps: recipe.steps,
         palatability_passed: verdict.passes,
         palatability_note: verdict.note || null,
+        on_target: onTarget,
+        off_target_note: onTarget ? null : solved.misses.join("; "),
       };
       setCurrent(result);
-      log(`Done.`);
+      log(onTarget ? `Done.` : `Done, but macros are off (see above) — your call whether to keep.`);
     } catch (e) {
       setErr(e.message);
       log(`ERROR: ${e.message}`);
@@ -530,10 +565,16 @@ function RecipeCard({ r, onKeep, keepLabel }) {
     <div className="card">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <h2 style={{ margin: "0 0 4px" }}>{r.title}</h2>
-        <span className={`pill ${r.palatability_passed ? "ok" : "warn"}`}>
-          {r.palatability_passed ? "taste ✓" : "needs a look"}
-        </span>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {r.on_target === false && <span className="pill warn">macros off</span>}
+          <span className={`pill ${r.palatability_passed ? "ok" : "warn"}`}>
+            {r.palatability_passed ? "taste ✓" : "needs a look"}
+          </span>
+        </div>
       </div>
+      {r.on_target === false && r.off_target_note && (
+        <div className="note" style={{ color: "#9c3d2e" }}>Macros off target: {r.off_target_note}</div>
+      )}
 
       <div className="macros">
         <div className="macro"><div className="v">{Math.round(r.actual_calories)}</div><div className="l">kcal</div></div>
