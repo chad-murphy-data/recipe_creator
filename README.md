@@ -8,23 +8,43 @@ blind palatability judge approves on taste alone so the food stays edible.
 
 Per request the app runs this pipeline:
 
-1. **Generator** (Claude) proposes a recipe: per ingredient a display name, a USDA
+1. **Generator** (Claude) designs a dish: per ingredient a display name, a USDA
    search phrase, a `match` term (the food word that must appear in the matched
-   USDA entry), and a cooked gram weight, plus steps. Grams are always the cooked
-   weight and the query targets a cooked entry, so there is no raw to cooked math.
+   USDA entry), a `role` (protein/carb/vegetable/legume/fat/seasoning), and a
+   rough cooked gram weight, plus steps. The grams are only a starting point.
 2. **Grounding** (code) sends those ingredients to a Supabase edge function that
    queries USDA, verifies each hit actually contains the `match` term (so edamame
-   can't silently resolve to asparagus), fetches per 100g macros, and returns
-   authoritative totals.
-3. **Reconcile**: if totals are off target, loop back to the Generator with the
-   real shortfall (cap 4 rounds).
-4. **Palatability judge** (a separate Claude call given no macro targets) passes
-   or rejects on taste. A failure triggers a revision and a re-ground, so a taste
-   fix cannot silently break the macros (cap 3 rounds).
-5. **Save** to Supabase.
+   can't silently resolve to asparagus), and returns each ingredient's per-100g
+   macros.
+3. **Solve** (code, `src/solver.js`): the precision engine. Macros are linear in
+   grams, so hitting the targets is a small bounded least-squares solve on the
+   per-100g vectors. Code computes the exact gram weights, within sane per-role
+   bounds (it can trim the rice but not delete it, and can't drown the dish in
+   oil to reach a calorie number). Deterministic: the same recipe always solves
+   the same way.
+4. **Swap, only if needed**: if no portioning can hit the targets, the ingredient
+   *set* is wrong, not the amounts. The Generator is asked to swap or add one
+   ingredient (e.g. beans for a fiber gap), then we re-ground and re-solve (cap 4).
+5. **Palatability judge** (a separate Claude call given no macro targets) passes
+   or rejects on taste. A failure triggers a revision, then a re-ground and
+   re-solve, so a taste fix cannot silently break the macros (cap 3 rounds).
+6. **Save** to Supabase. If the solve still couldn't hit target, the recipe is
+   saved and shown flagged (`on_target = false`) rather than passed off as good.
 
-The model never sees a nutrition number it can game, and the judge never sees a
-number it could be seduced into chasing. That split is the whole point.
+The model designs the food; code owns the numbers. The model never sees a
+nutrition number it can game, and the judge never sees a number it could be
+seduced into chasing. That split is the whole point.
+
+## Tests
+
+```bash
+npm test
+```
+
+`src/solver.test.js` proves the precision engine: it hits realistic targets,
+trims a carb-heavy ingredient instead of zeroing it, refuses to inflate calories
+with oil, reports infeasible ingredient sets instead of silently saving off
+target, and is deterministic.
 
 ## Stack
 
