@@ -37,11 +37,19 @@ function descMatches(description: string, matchTerm: string): boolean {
   return words.every((w) => tokens.some((t) => t === w || t.startsWith(w) || w.startsWith(t)));
 }
 
-// From a set of hits, pick the right food in a cooked form: require the match
-// term, prefer a cooked/prepared description, and avoid raw.
-function selectHit(hits: any[], matchTerm: string) {
+// From a set of hits, pick the right food in the requested preparation: require
+// the match term, then prefer the right form. "cooked" prefers cooked/prepared
+// and avoids raw; "raw" prefers raw and avoids clearly-cooked. Falls back within
+// the noun matches if the exact form isn't available.
+function selectHit(hits: any[], matchTerm: string, prep: string) {
   const nounMatches = matchTerm ? hits.filter((h: any) => descMatches(h.description, matchTerm)) : hits;
   if (!nounMatches.length) return null;
+  if (prep === "raw") {
+    const raw = nounMatches.filter((h: any) => isRaw(h.description));
+    if (raw.length) return raw[0];
+    const notCooked = nounMatches.filter((h: any) => !isCooked(h.description));
+    return notCooked[0] ?? nounMatches[0];
+  }
   const cooked = nounMatches.filter((h: any) => isCooked(h.description) && !isRaw(h.description));
   if (cooked.length) return cooked[0];
   const notRaw = nounMatches.filter((h: any) => !isRaw(h.description));
@@ -65,8 +73,10 @@ async function macros(fdcId: number) {
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   try {
-    const { ingredients } = await req.json(); // [{name, usdaQuery, match?, grams}]
+    const { ingredients, prep: prepRaw } = await req.json(); // [{name, usdaQuery, match?, grams, fdcId?}], prep
     if (!Array.isArray(ingredients)) throw new Error("Body must include an 'ingredients' array.");
+    // Default to "cooked" when not specified, so older clients keep their behavior.
+    const prep = prepRaw === "raw" ? "raw" : "cooked";
     const grounded: any[] = [];
     const total = { kcal:0, protein:0, fat:0, carbs:0, fiber:0 };
     for (const ing of ingredients) {
@@ -76,15 +86,15 @@ Deno.serve(async (req: Request) => {
         //    fetch carries the description, so we trust the caller's pin.
         chosen = { fdcId: ing.fdcId, description: null };
       } else {
-        // 1) Try the generator's detailed cooked-targeted query (precise variant).
+        // 1) Try the generator's detailed query (precise variant for this prep).
         let hits = await search(ing.usdaQuery);
-        chosen = selectHit(hits, ing.match);
+        chosen = selectHit(hits, ing.match, prep);
         // 2) Fallback: search the bare food noun. A noisy query like
         //    "shelled edamame cooked" floods results with "cooked" vegetables and
         //    buries the real "Edamame" entry; "edamame" alone finds it.
         if (!chosen && ing.match && ing.match.trim().toLowerCase() !== (ing.usdaQuery ?? "").trim().toLowerCase()) {
           hits = await search(ing.match);
-          chosen = selectHit(hits, ing.match);
+          chosen = selectHit(hits, ing.match, prep);
         }
         if (!chosen) {
           const seen = hits.slice(0, 3).map((h: any) => h.description).join(" | ");

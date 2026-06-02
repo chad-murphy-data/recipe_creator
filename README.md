@@ -11,12 +11,17 @@ Per request the app runs this pipeline:
 1. **Generator** (Claude) designs a dish: per ingredient a display name, a USDA
    search phrase, a `match` term (the food word that must appear in the matched
    USDA entry), a `role` (protein/carb/vegetable/legume/fat/seasoning), and a
-   rough cooked gram weight, plus steps. The grams are only a starting point.
+   rough gram weight, plus steps. The grams are only a starting point.
+   Weights are **raw** by default (weighed uncooked, how most people portion at
+   prep time); a Raw/Cooked toggle on the Make tab switches to cooked entries.
+   The chosen mode is stored per recipe.
 2. **Grounding** (code) sends those ingredients to a Supabase edge function that
    queries USDA, verifies each hit actually contains the `match` term (so edamame
-   can't silently resolve to asparagus), and returns each ingredient's per-100g
-   macros. Charlie's staple foods (`src/staples.js`) resolve to a pinned USDA
-   entry, so common ingredients skip the fuzzy search and use a known-good ID.
+   can't silently resolve to asparagus) and is in the requested prep (raw vs
+   cooked), and returns each ingredient's per-100g macros. Charlie's staple foods
+   (`src/staples.js`, cooked entries) pin a USDA
+   entry in cooked mode, so common ingredients skip the fuzzy search and use a
+   known-good ID; raw mode falls through to the prep-aware search.
 3. **Solve** (code, `src/solver.js`): the precision engine. Macros are linear in
    grams, so hitting the targets is a small bounded least-squares solve on the
    per-100g vectors. Code computes the exact gram weights, within sane per-role
