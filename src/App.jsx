@@ -52,7 +52,7 @@ const appPassword = () =>
   (typeof sessionStorage !== "undefined" && sessionStorage.getItem("rb_pw")) || "";
 
 // ── USDA grounding via Supabase edge function (server-side, no CORS/sandbox issue) ──
-async function groundViaEdge(sb, ingredients) {
+async function groundViaEdge(sb, ingredients, prep) {
   const r = await fetch(`${sb.url}/functions/v1/usda-ground`, {
     method: "POST",
     headers: {
@@ -60,7 +60,7 @@ async function groundViaEdge(sb, ingredients) {
       Authorization: `Bearer ${sb.key}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ ingredients }),
+    body: JSON.stringify({ ingredients, prep }),
   });
   const d = await r.json();
   if (!r.ok) throw new Error(d.error || `Grounding failed (${r.status})`);
@@ -105,13 +105,20 @@ function parseJSON(text) {
 // The model designs the DISH. It does not have to nail the macros: code solves
 // the exact gram weights afterward. Its grams are just a sensible starting point,
 // and its "role" tags tell the solver how far each ingredient may be adjusted.
-async function generateRecipe(targets, prefs, feedback, avoidTitles) {
+async function generateRecipe(targets, prefs, feedback, avoidTitles, prep) {
+  const raw = prep === "raw";
+  const weightWord = raw ? "RAW (uncooked) gram weight" : "COOKED gram weight";
+  const queryHint = raw
+    ? `that will match a RAW entry (e.g. "chicken breast raw", "broccoli raw", "brown rice raw"). Prefer raw/uncooked forms.`
+    : `that will match a COOKED entry (e.g. "chicken breast meat only cooked roasted", "broccoli cooked boiled", "brown rice cooked"). Prefer cooked/roasted/boiled forms.`;
   const system = `You design dinner recipes for ONE serving. A separate program will fine-tune the exact gram weights to hit macro targets, so you do not need to nail the numbers. Your job is a real, appealing, balanced dish with the right KINDS and rough amounts of food.
 
+All ingredient weights are ${raw ? "RAW (weighed uncooked, before cooking)" : "COOKED (weighed after cooking)"}.
+
 HARD RULES:
-- For every ingredient, give a COOKED gram weight (cooked, not raw) as a reasonable starting amount.
-- For every ingredient, propose a USDA FoodData Central search phrase that will match a COOKED entry (e.g. "chicken breast meat only cooked roasted", "broccoli cooked boiled", "brown rice cooked"). Prefer cooked/roasted/boiled forms.
-- For every ingredient, give "match": the identifying food word(s) the correct USDA entry MUST contain. Use the distinctive food noun, not preparation words. Examples: "shelled edamame, cooked" -> "edamame"; "low-sodium soy sauce" -> "soy sauce". Be specific for proteins, grains, and produce; a general word is fine for a minor seasoning (e.g. "vinegar").
+- For every ingredient, give a ${weightWord} as a reasonable starting amount.
+- For every ingredient, propose a USDA FoodData Central search phrase ${queryHint}
+- For every ingredient, give "match": the identifying food word(s) the correct USDA entry MUST contain. Use the distinctive food noun, not preparation words. Examples: "edamame", "chicken breast", "soy sauce". Be specific for proteins, grains, and produce; a general word is fine for a minor seasoning (e.g. "vinegar").
 - For every ingredient, give "role": one of "protein", "carb", "vegetable", "legume", "fat", "seasoning". This controls how much the amount may be adjusted, so be accurate (oils/butter = "fat"; sauces/spices/aromatics = "seasoning").
 - Include enough of a clear protein source, a clear carb source, and produce that the targets are reachable by adjusting amounts. (To reach ${targets.protein_g}g protein you need a real protein anchor; to reach ${targets.fiber_g}g fiber you need beans/whole grains/veg.)
 - Real, appealing food a person would actually want to eat. No garnish mountains.
@@ -120,7 +127,7 @@ Respond ONLY with JSON, no prose, no backticks:
 {
   "title": "string",
   "ingredients": [
-    {"name":"display name","usdaQuery":"search phrase for a cooked entry","match":"identifying food word(s) that must appear in the USDA entry","role":"protein|carb|vegetable|legume|fat|seasoning","grams":number}
+    {"name":"display name","usdaQuery":"USDA search phrase for a ${raw ? "raw" : "cooked"} entry","match":"identifying food word(s) that must appear in the USDA entry","role":"protein|carb|vegetable|legume|fat|seasoning","grams":number}
   ],
   "steps": ["step 1","step 2"]
 }`;
@@ -134,6 +141,7 @@ Respond ONLY with JSON, no prose, no backticks:
     : "";
 
   const user = `Targets (per serving): ${targets.calories} kcal, ${targets.protein_g}g protein, ${targets.carbs_g}g carbs, ${targets.fiber_g}g fiber.
+Weights are ${raw ? "RAW" : "COOKED"}.
 Preferences: ${prefs}${variety}
 ${feedback ? `\nREVISION NEEDED:\n${feedback}` : ""}`;
 
@@ -161,16 +169,16 @@ ${recipe.steps.map((s, n) => `${n + 1}. ${s}`).join("\n")}`;
 // ── Grounding: delegate to edge function, then log results ───────────────
 // We carry the model's "role" onto each grounded ingredient so the solver knows
 // how far it may adjust each amount (the edge function doesn't echo role back).
-// Staples resolve to a pinned fdcId, which the edge function fetches directly,
-// skipping the fuzzy search for Charlie's regulars.
-async function groundRecipe(recipe, sb, log) {
-  log(`  Sending ${recipe.ingredients.length} ingredients to USDA grounding…`);
+// Staples resolve to a pinned fdcId (COOKED entries), so they only apply in
+// cooked mode; raw mode falls through to the prep-aware search.
+async function groundRecipe(recipe, sb, log, prep) {
+  log(`  Sending ${recipe.ingredients.length} ingredients to USDA grounding (${prep})…`);
   const payload = recipe.ingredients.map((i) => {
-    const pin = resolveStaple(i.match);
+    const pin = prep === "cooked" ? resolveStaple(i.match) : null;
     if (pin) log(`    · ${i.name}: pinned to ${pin.label} (FDC ${pin.fdcId})`);
     return { name: i.name, usdaQuery: i.usdaQuery, grams: i.grams, match: i.match, fdcId: pin?.fdcId };
   });
-  const { grounded, total } = await groundViaEdge(sb, payload);
+  const { grounded, total } = await groundViaEdge(sb, payload, prep);
   grounded.forEach((g, idx) => {
     if (recipe.ingredients[idx]) g.role = recipe.ingredients[idx].role;
   });
@@ -206,6 +214,7 @@ export default function App() {
   const sb = SB;
   const [targets, setTargets] = useState(DEFAULT_TARGETS);
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
+  const [prep, setPrep] = useState("raw"); // weigh ingredients raw (default) or cooked
 
   const [busy, setBusy] = useState(false);
   const [logLines, setLogLines] = useState([]);
@@ -281,6 +290,8 @@ export default function App() {
             ? `Change the user wants: "${rerollNote}". Make that change and otherwise keep the recipe as close to the original as possible.`
             : `Make a small improvement while keeping it the same dish.`);
       }
+      // Rerolls keep the original recipe's prep; a fresh make uses the toggle.
+      const activePrep = isReroll && baseRecipe.prep ? baseRecipe.prep : prep;
       let feedback = baseFeedback;
       let recipe = null;
       let grounded = null;
@@ -291,9 +302,9 @@ export default function App() {
       //    any portioning (then it swaps an ingredient, not re-guesses grams).
       for (let round = 1; round <= MAX_SWAP_ROUNDS; round++) {
         log(round === 1 ? `Generator…` : `Generator — swapping an ingredient (round ${round})…`);
-        recipe = await generateRecipe(targets, prefs, feedback, avoidTitles);
+        recipe = await generateRecipe(targets, prefs, feedback, avoidTitles, activePrep);
         log(`Proposed: "${recipe.title}". Grounding in USDA…`);
-        ({ grounded } = await groundRecipe(recipe, sb, log));
+        ({ grounded } = await groundRecipe(recipe, sb, log, activePrep));
 
         log(`Solving exact portions…`);
         solved = solvePortions(grounded, targets);
@@ -342,10 +353,11 @@ export default function App() {
           targets,
           prefs,
           `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem. Amounts will be re-tuned automatically, so focus on the dish itself.`,
-          avoidTitles
+          avoidTitles,
+          activePrep
         );
         log(`Revised for taste: "${recipe.title}". Re-grounding and re-solving…`);
-        ({ grounded } = await groundRecipe(recipe, sb, log));
+        ({ grounded } = await groundRecipe(recipe, sb, log, activePrep));
         solved = solvePortions(grounded, targets);
         grounded = applyGrams(grounded, solved.grams);
         total = solved.total;
@@ -376,6 +388,7 @@ export default function App() {
         palatability_note: verdict.note || null,
         on_target: onTarget,
         off_target_note: onTarget ? null : solved.misses.join("; "),
+        prep: activePrep,
       };
       setCurrent(result);
       log(onTarget ? `Done.` : `Done, but macros are off (see above) — your call whether to keep.`);
@@ -560,6 +573,21 @@ export default function App() {
                   <div className="field">
                     <label>Preferences</label>
                     <textarea rows={2} value={prefs} onChange={(e) => setPrefs(e.target.value)} />
+                  </div>
+                  <div className="field" style={{ flex: "none" }}>
+                    <label>Weigh ingredients</label>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {["raw", "cooked"].map((p) => (
+                        <button
+                          key={p}
+                          type="button"
+                          className={`chip ${prep === p ? "chip-on" : ""}`}
+                          onClick={() => setPrep(p)}
+                        >
+                          {p === "raw" ? "Raw" : "Cooked"}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                   <button className="btn" disabled={!ready || busy} onClick={() => run()}>
                     {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Supabase not configured"}
@@ -771,7 +799,10 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
         {fiber != null && <div className="macro"><div className="v">{fiber}</div><div className="l">fiber</div></div>}
       </div>
 
-      <h3 style={{ marginBottom: 6 }}>Ingredients</h3>
+      <h3 style={{ marginBottom: 2 }}>Ingredients</h3>
+      <div className="note" style={{ marginTop: 0, marginBottom: 6 }}>
+        Weights are {r.prep === "raw" ? "raw (weighed uncooked)" : "cooked"}.
+      </div>
       {ings.map((i, n) => (
         <div className="ing" key={n}>
           <span>{i.grams_cooked}g {i.name}</span>

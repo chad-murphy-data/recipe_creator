@@ -24,16 +24,16 @@ test("list issues a GET ordered by created_at", async () => {
   } finally { restore(); }
 });
 
-test("create strips non-whitelisted fields", async () => {
+test("create strips non-whitelisted fields but keeps allowed ones (incl prep)", async () => {
   const cap = {};
   const restore = stubFetch(cap);
   try {
     await handleRecipes(
-      { action: "create", record: { title: "X", status: "liked", id: "hax", evil: 1, created_at: "spoof" } },
+      { action: "create", record: { title: "X", status: "liked", prep: "raw", id: "hax", evil: 1, created_at: "spoof" } },
       ENV
     );
     const sent = JSON.parse(cap.init.body);
-    assert.deepEqual(Object.keys(sent).sort(), ["status", "title"]);
+    assert.deepEqual(Object.keys(sent).sort(), ["prep", "status", "title"]);
     assert.equal(sent.id, undefined);
     assert.equal(sent.evil, undefined);
   } finally { restore(); }

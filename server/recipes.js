@@ -15,7 +15,7 @@ const ALLOWED_FIELDS = new Set([
   "target_calories", "target_protein_g", "target_carbs_g", "target_fiber_g",
   "actual_calories", "actual_protein_g", "actual_fat_g", "actual_carbs_g", "actual_fiber_g",
   "ingredients", "steps", "palatability_passed", "palatability_note",
-  "on_target", "off_target_note", "status", "tags",
+  "on_target", "off_target_note", "status", "tags", "prep",
 ]);
 
 // Whitelist what the client may write, so the endpoint can't be used to set
