@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { solvePortions, applyGrams, totalsFromGrams, offTarget, TOL } from "./solver.js";
 import { resolveStaple } from "./staples.js";
+import { tasteProfile, tastePromptSection, EMPTY_TASTE } from "./taste.js";
 
 // ─────────────────────────────────────────────────────────────────────────
 //  Charlie's Recipe Box
@@ -105,7 +106,7 @@ function parseJSON(text) {
 // The model designs the DISH. It does not have to nail the macros: code solves
 // the exact gram weights afterward. Its grams are just a sensible starting point,
 // and its "role" tags tell the solver how far each ingredient may be adjusted.
-async function generateRecipe(targets, prefs, feedback, avoidTitles, prep) {
+async function generateRecipe(targets, prefs, feedback, taste, prep) {
   const raw = prep === "raw";
   const weightWord = raw ? "RAW (uncooked) gram weight" : "COOKED gram weight";
   const queryHint = raw
@@ -132,13 +133,11 @@ Respond ONLY with JSON, no prose, no backticks:
   "steps": ["step 1","step 2"]
 }`;
 
-  // Variety nudge: the inputs are otherwise identical every run, so the model
-  // keeps landing on the same obvious dish (umami + chicken = miso chicken).
-  // Showing it what to avoid breaks the loop without touching the targets.
-  const avoid = (avoidTitles || []).filter(Boolean).slice(0, 8);
-  const variety = avoid.length
-    ? `\nMake something genuinely DIFFERENT from these recent recipes (vary the cuisine and the main protein, do not just rename): ${avoid.join("; ")}.`
-    : "";
+  // Taste signal: the box teaches the generator. Liked dishes pull toward their
+  // style, disliked push away, and recent ones keep it from reissuing the same
+  // meal (the old "miso chicken every time" loop). This only shapes the DISH;
+  // code still solves the macros and the judge stays blind, so no guardrail moves.
+  const variety = tastePromptSection(taste);
 
   const user = `Targets (per serving): ${targets.calories} kcal, ${targets.protein_g}g protein, ${targets.carbs_g}g carbs, ${targets.fiber_g}g fiber.
 Weights are ${raw ? "RAW" : "COOKED"}.
@@ -217,6 +216,7 @@ export default function App() {
   const [prep, setPrep] = useState("raw"); // weigh ingredients raw (default) or cooked
 
   const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState("idle"); // drives the cooking-chef caption
   const [logLines, setLogLines] = useState([]);
   const [current, setCurrent] = useState(null);
   const [box, setBox] = useState([]);
@@ -261,6 +261,14 @@ export default function App() {
     }
   }
 
+  // Load the box as soon as we're in, so the Make tab's taste signal (and the
+  // variety nudge) are ready on the very first generate, not only after the
+  // user has visited The Box tab.
+  useEffect(() => {
+    if (unlocked) refreshBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unlocked]);
+
   async function run(opts = {}) {
     const { rerollNote = "", baseRecipe = null } = opts;
     setErr("");
@@ -271,10 +279,10 @@ export default function App() {
     try {
       const isReroll = Boolean(baseRecipe);
 
-      // A reroll TWEAKS the existing dish, so variety is OFF (we want to keep it,
-      // not avoid it) and we seed the model with the current recipe. A fresh make
-      // turns variety ON: avoid repeating what's already in the box.
-      const avoidTitles = isReroll ? [] : box.map((b) => b.title);
+      // The box teaches the generator: liked -> lean toward, disliked -> steer
+      // clear, recent -> don't repeat. A reroll is a targeted tweak of one dish,
+      // so it carries no taste profile (we want to keep that dish, not vary it).
+      const taste = isReroll ? EMPTY_TASTE : tasteProfile(box);
 
       // baseFeedback persists across swap rounds so the "keep this dish" intent
       // (or the change request) isn't lost when macro-miss feedback is appended.
@@ -301,11 +309,14 @@ export default function App() {
       //    back to the model when the ingredient SET can't hit the targets at
       //    any portioning (then it swaps an ingredient, not re-guesses grams).
       for (let round = 1; round <= MAX_SWAP_ROUNDS; round++) {
+        setPhase("generating");
         log(round === 1 ? `Generator…` : `Generator — swapping an ingredient (round ${round})…`);
-        recipe = await generateRecipe(targets, prefs, feedback, avoidTitles, activePrep);
+        recipe = await generateRecipe(targets, prefs, feedback, taste, activePrep);
+        setPhase("grounding");
         log(`Proposed: "${recipe.title}". Grounding in USDA…`);
         ({ grounded } = await groundRecipe(recipe, sb, log, activePrep));
 
+        setPhase("solving");
         log(`Solving exact portions…`);
         solved = solvePortions(grounded, targets);
         for (const c of solved.changes) {
@@ -338,6 +349,7 @@ export default function App() {
       //    macros can't silently drift off target.
       let verdict = { passes: true, note: "" };
       for (let t = 1; t <= MAX_TASTE_ROUNDS; t++) {
+        setPhase("tasting");
         log(`Palatability judge (blind) — round ${t}…`);
         verdict = await judgePalatability({ ...recipe, ingredients: grounded.map((g) => ({ name: g.name, grams: g.grams_cooked })) });
         if (verdict.passes) {
@@ -349,15 +361,20 @@ export default function App() {
           log(`Reached taste round cap — surfacing for your call.`);
           break;
         }
+        setPhase("generating");
         recipe = await generateRecipe(
           targets,
           prefs,
           `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem. Amounts will be re-tuned automatically, so focus on the dish itself.`,
-          avoidTitles,
+          // Keep variety so the fix isn't a near-dupe, but drop the like/dislike
+          // lean here: the specific taste note is what should drive this revision.
+          { liked: [], disliked: [], recent: taste.recent },
           activePrep
         );
+        setPhase("grounding");
         log(`Revised for taste: "${recipe.title}". Re-grounding and re-solving…`);
         ({ grounded } = await groundRecipe(recipe, sb, log, activePrep));
+        setPhase("solving");
         solved = solvePortions(grounded, targets);
         grounded = applyGrams(grounded, solved.grams);
         total = solved.total;
@@ -390,9 +407,11 @@ export default function App() {
         off_target_note: onTarget ? null : solved.misses.join("; "),
         prep: activePrep,
       };
+      setPhase("done");
       setCurrent(result);
       log(onTarget ? `Done.` : `Done, but macros are off (see above) — your call whether to keep.`);
     } catch (e) {
+      setPhase("error");
       setErr(e.message);
       log(`ERROR: ${e.message}`);
     } finally {
@@ -522,6 +541,23 @@ export default function App() {
     .chip-on { background:#2b2622; color:#f4ede1; border-color:#2b2622; }
     .field select { width:100%; padding:8px 10px; border:1.5px solid #d8c9ad; border-radius:3px;
       font-family:'Spline Sans'; font-size:14px; background:#fff; }
+    /* Cooking chef — the generation animation. Pure SVG/CSS, themed to the box. */
+    .chef-wrap { display:flex; flex-direction:column; align-items:center; gap:8px; padding:6px 0 14px; }
+    .chef { width:180px; height:auto; display:block; }
+    .chef-cap { font-family:'Fraunces',serif; font-style:italic; color:#8a7a5c; font-size:15px; min-height:1.3em; text-align:center; }
+    .chef-bob { animation: chefBob 2.6s ease-in-out infinite; }
+    .chef .steam { animation: steamRise 2.8s ease-in-out infinite; }
+    .chef .steam-b { animation-delay:0.7s; }
+    .chef .steam-c { animation-delay:1.4s; }
+    .chef .stir { transform-box: view-box; transform-origin: 110px 116px; animation: stir 1.9s ease-in-out infinite; }
+    .chef .sauce { animation: sauceWobble 1.9s ease-in-out infinite; }
+    @keyframes chefBob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+    @keyframes steamRise { 0% { opacity:0; transform: translateY(8px); } 35% { opacity:0.6; } 100% { opacity:0; transform: translateY(-14px); } }
+    @keyframes stir { 0%,100% { transform: rotate(-13deg); } 50% { transform: rotate(13deg); } }
+    @keyframes sauceWobble { 0%,100% { transform: translateX(-1.5px); } 50% { transform: translateX(1.5px); } }
+    @media (prefers-reduced-motion: reduce) {
+      .chef-bob, .chef .steam, .chef .stir, .chef .sauce { animation: none; }
+    }
   `;
 
   return (
@@ -592,12 +628,16 @@ export default function App() {
                   <button className="btn" disabled={!ready || busy} onClick={() => run()}>
                     {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Supabase not configured"}
                   </button>
+                  <TasteHint box={box} />
                 </div>
 
-                {logLines.length > 0 && (
+                {(busy || logLines.length > 0) && (
                   <div className="card">
                     <h3 style={{ marginTop: 0 }}>Kitchen pass</h3>
-                    <div className="log" ref={logRef}>{logLines.join("\n")}</div>
+                    {busy && <CookingChef phase={phase} />}
+                    {logLines.length > 0 && (
+                      <div className="log" ref={logRef}>{logLines.join("\n")}</div>
+                    )}
                   </div>
                 )}
 
@@ -626,6 +666,80 @@ export default function App() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// A small line under the Generate button so the taste-learning is legible: it
+// tells Charlie the box is actually steering what gets made, not just archiving.
+function TasteHint({ box }) {
+  const liked = box.filter((r) => (r.status || "untried") === "liked").length;
+  const disliked = box.filter((r) => (r.status || "untried") === "disliked").length;
+  if (!liked && !disliked) return null;
+  const parts = [];
+  if (liked) parts.push(`leaning on ${liked} you liked`);
+  if (disliked) parts.push(`steering clear of ${disliked} you didn't`);
+  return (
+    <div className="note" style={{ marginTop: 10 }}>
+      Learning from your box: {parts.join(" and ")}.
+    </div>
+  );
+}
+
+// The cooking chef shown while the kitchen runs. Hand-built SVG + CSS (see the
+// .chef styles): no image asset, themed to the box's palette, and it honors
+// prefers-reduced-motion. The caption tracks the real pipeline phase, so the
+// animation is wired to the actual work rather than being a generic spinner.
+const CHEF_CAPTIONS = {
+  idle: "Warming the stove…",
+  generating: "Dreaming up a dish…",
+  grounding: "Weighing it against USDA…",
+  solving: "Solving the exact grams…",
+  tasting: "Giving it a taste…",
+  done: "Plating up…",
+  error: "Something boiled over.",
+};
+
+function CookingChef({ phase }) {
+  const caption = CHEF_CAPTIONS[phase] || CHEF_CAPTIONS.idle;
+  return (
+    <div className="chef-wrap">
+      <svg className="chef" viewBox="0 0 220 180" role="img" aria-label="A chef stirring a pot">
+        <g className="chef-bob">
+          {/* apron/chest, mostly hidden behind the pot */}
+          <rect x="86" y="78" width="48" height="62" rx="14" fill="#9c3d2e" stroke="#2b2622" strokeWidth="2.5" />
+          {/* toque */}
+          <circle cx="96" cy="34" r="13" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          <circle cx="124" cy="34" r="13" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          <circle cx="110" cy="26" r="15" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          <rect x="90" y="40" width="40" height="14" rx="4" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          {/* head + face */}
+          <circle cx="110" cy="64" r="20" fill="#f3d7b0" stroke="#2b2622" strokeWidth="2.5" />
+          <circle cx="103" cy="62" r="2.2" fill="#2b2622" />
+          <circle cx="117" cy="62" r="2.2" fill="#2b2622" />
+          <path d="M103 72 Q110 78 117 72" fill="none" stroke="#2b2622" strokeWidth="2" strokeLinecap="round" />
+          <circle cx="99" cy="70" r="2.6" fill="#d98a6a" opacity="0.5" />
+          <circle cx="121" cy="70" r="2.6" fill="#d98a6a" opacity="0.5" />
+          {/* steam (drawn before the pot so it appears to rise out of it) */}
+          <g fill="none" stroke="#cbb89a" strokeWidth="3.2" strokeLinecap="round">
+            <path className="steam steam-a" d="M92 116 q-5 -8 0 -16 q5 -8 0 -16" />
+            <path className="steam steam-b" d="M110 116 q-5 -9 0 -18 q5 -9 0 -18" />
+            <path className="steam steam-c" d="M128 116 q-5 -8 0 -16 q5 -8 0 -16" />
+          </g>
+          {/* stirring spoon (rotates around the rim) */}
+          <g className="stir">
+            <line x1="110" y1="116" x2="142" y2="86" stroke="#7a4a22" strokeWidth="5" strokeLinecap="round" />
+            <circle cx="143" cy="85" r="6" fill="#f3d7b0" stroke="#2b2622" strokeWidth="2.5" />
+          </g>
+          {/* pot, in front */}
+          <path d="M64 118 L156 118 L150 150 Q149 157 142 157 L78 157 Q71 157 70 150 Z" fill="#2b2622" />
+          <ellipse cx="110" cy="118" rx="48" ry="9" fill="#3a322b" stroke="#2b2622" strokeWidth="2" />
+          <ellipse className="sauce" cx="110" cy="117" rx="39" ry="6" fill="#c8643f" />
+          <path d="M62 124 q-9 2 -9 10" fill="none" stroke="#2b2622" strokeWidth="3.5" strokeLinecap="round" />
+          <path d="M158 124 q9 2 9 10" fill="none" stroke="#2b2622" strokeWidth="3.5" strokeLinecap="round" />
+        </g>
+      </svg>
+      <div className="chef-cap">{caption}</div>
     </div>
   );
 }
