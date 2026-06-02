@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { solvePortions, offTarget, TOL } from "./solver.js";
+import { solvePortions, applyGrams, totalsFromGrams, offTarget, TOL } from "./solver.js";
 import { resolveStaple } from "./staples.js";
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -178,70 +178,26 @@ async function groundRecipe(recipe, sb, log) {
   return { grounded, total };
 }
 
-// Apply solved gram weights back onto the grounded ingredients so saved/displayed
-// amounts and per-ingredient contributions reflect the final portions.
-function applyGrams(grounded, grams) {
-  return grounded.map((g, i) => {
-    const f = (grams[i] ?? 0) / 100;
-    const p = g.per100g || {};
-    return {
-      ...g,
-      grams_cooked: grams[i],
-      contributes: {
-        kcal: (p.kcal || 0) * f, protein: (p.protein || 0) * f, fat: (p.fat || 0) * f,
-        carbs: (p.carbs || 0) * f, fiber: (p.fiber || 0) * f,
-      },
-    };
-  });
-}
-
-// ── Supabase (REST) ────────────────────────────────────────────────────────
-async function saveRecipe(sb, record) {
-  const r = await fetch(`${sb.url}/rest/v1/recipes`, {
+// ── Recipes via the server (/api/recipes) ───────────────────────────────────
+// The browser no longer touches Supabase directly; the server endpoint holds the
+// DB key and is password-gated, so the public key can't be used to read/wipe the
+// box from the bundle. The grounding edge function is still called directly (it's
+// a stateless USDA utility with no DB access).
+async function recipesApi(action, payload) {
+  const r = await fetch("/api/recipes", {
     method: "POST",
-    headers: {
-      apikey: sb.key,
-      Authorization: `Bearer ${sb.key}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(record),
+    headers: { "Content-Type": "application/json", "x-app-password": appPassword() },
+    body: JSON.stringify({ action, ...payload }),
   });
-  if (!r.ok) throw new Error(`Supabase save failed (${r.status}): ${await r.text()}`);
-  return (await r.json())[0];
+  const d = await r.json();
+  if (!r.ok) throw new Error(d?.error?.message || `Recipes request failed (${r.status})`);
+  return d;
 }
 
-async function loadRecipes(sb) {
-  const r = await fetch(
-    `${sb.url}/rest/v1/recipes?select=*&order=created_at.desc`,
-    { headers: { apikey: sb.key, Authorization: `Bearer ${sb.key}` } }
-  );
-  if (!r.ok) throw new Error(`Supabase load failed (${r.status})`);
-  return r.json();
-}
-
-async function updateRecipe(sb, id, patch) {
-  const r = await fetch(`${sb.url}/rest/v1/recipes?id=eq.${id}`, {
-    method: "PATCH",
-    headers: {
-      apikey: sb.key,
-      Authorization: `Bearer ${sb.key}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(patch),
-  });
-  if (!r.ok) throw new Error(`Supabase update failed (${r.status}): ${await r.text()}`);
-  return (await r.json())[0];
-}
-
-async function deleteRecipe(sb, id) {
-  const r = await fetch(`${sb.url}/rest/v1/recipes?id=eq.${id}`, {
-    method: "DELETE",
-    headers: { apikey: sb.key, Authorization: `Bearer ${sb.key}` },
-  });
-  if (!r.ok) throw new Error(`Supabase delete failed (${r.status}): ${await r.text()}`);
-}
+const saveRecipe = (record) => recipesApi("create", { record });
+const loadRecipes = () => recipesApi("list", {});
+const updateRecipe = (id, patch) => recipesApi("update", { id, patch });
+const deleteRecipe = (id) => recipesApi("delete", { id });
 
 // ─────────────────────────────────────────────────────────────────────────
 //  UI
@@ -290,7 +246,7 @@ export default function App() {
 
   async function refreshBox() {
     try {
-      setBox(await loadRecipes(sb));
+      setBox(await loadRecipes());
     } catch (e) {
       setErr(e.message);
     }
@@ -304,16 +260,28 @@ export default function App() {
     setBusy(true);
     setTab("make");
     try {
-      // Variety: avoid repeating the current candidate, the saved box, and (on a
-      // reroll) the recipe being rerolled.
-      const avoidTitles = [
-        baseRecipe?.title,
-        ...box.map((b) => b.title),
-      ];
-      // A reroll note is a user-driven revision request; feed it like feedback.
-      let feedback = rerollNote
-        ? `The user wants this changed: "${rerollNote}". Keep what works, address that note.`
-        : "";
+      const isReroll = Boolean(baseRecipe);
+
+      // A reroll TWEAKS the existing dish, so variety is OFF (we want to keep it,
+      // not avoid it) and we seed the model with the current recipe. A fresh make
+      // turns variety ON: avoid repeating what's already in the box.
+      const avoidTitles = isReroll ? [] : box.map((b) => b.title);
+
+      // baseFeedback persists across swap rounds so the "keep this dish" intent
+      // (or the change request) isn't lost when macro-miss feedback is appended.
+      let baseFeedback = "";
+      if (isReroll) {
+        const ingList = (baseRecipe.ingredients || [])
+          .map((i) => `${i.grams_cooked}g ${i.name}`)
+          .join(", ");
+        baseFeedback =
+          `TWEAK this existing recipe. Keep it fundamentally the same dish — same main protein and overall character — do NOT replace it with a different meal.\n` +
+          `Current recipe "${baseRecipe.title}": ${ingList}.\n` +
+          (rerollNote
+            ? `Change the user wants: "${rerollNote}". Make that change and otherwise keep the recipe as close to the original as possible.`
+            : `Make a small improvement while keeping it the same dish.`);
+      }
+      let feedback = baseFeedback;
       let recipe = null;
       let grounded = null;
       let solved = null;
@@ -343,9 +311,10 @@ export default function App() {
           break;
         }
         log(`✗ This ingredient set can't hit target: ${solved.misses.join("; ")}`);
-        feedback = `Code adjusted the portions as far as it sensibly could and STILL could not hit the targets: ${solved.misses.join(
+        const macroMiss = `Code adjusted the portions as far as it sensibly could and STILL could not hit the targets: ${solved.misses.join(
           "; "
         )}. The amounts are not the problem; the ingredient SET is. Swap in or add an ingredient that fixes this (e.g. a leaner/denser protein for a protein gap, beans or whole grains for a fiber gap) and keep the dish appetizing. Do not just change numbers.`;
+        feedback = [baseFeedback, macroMiss].filter(Boolean).join("\n\n");
         if (round === MAX_SWAP_ROUNDS)
           log(`Reached swap cap — keeping the closest version (flagged below).`);
       }
@@ -421,7 +390,7 @@ export default function App() {
   async function keep() {
     setErr("");
     try {
-      await saveRecipe(sb, current);
+      await saveRecipe(current);
       setCurrent(null);
       setTab("box");
       await refreshBox();
@@ -436,7 +405,7 @@ export default function App() {
     const prev = box;
     setBox((b) => b.map((r) => (r.id === id ? { ...r, ...patch } : r)));
     try {
-      await updateRecipe(sb, id, patch);
+      await updateRecipe(id, patch);
     } catch (e) {
       setBox(prev);
       setErr(e.message);
@@ -448,7 +417,7 @@ export default function App() {
     const prev = box;
     setBox((b) => b.filter((r) => r.id !== id));
     try {
-      await deleteRecipe(sb, id);
+      await deleteRecipe(id);
     } catch (e) {
       setBox(prev);
       setErr(e.message);
@@ -459,6 +428,29 @@ export default function App() {
   // a fresh candidate on the Make tab (non-destructive; the original stays put).
   function rerollFromBox(recipe, note) {
     run({ rerollNote: note, baseRecipe: recipe });
+  }
+
+  // Build the macro fields a recipe row stores from a recomputed total + misses.
+  function macroFields(total, misses) {
+    return {
+      actual_calories: +total.kcal.toFixed(1),
+      actual_protein_g: +total.protein.toFixed(1),
+      actual_fat_g: +total.fat.toFixed(1),
+      actual_carbs_g: +total.carbs.toFixed(1),
+      actual_fiber_g: +total.fiber.toFixed(1),
+      on_target: misses.length === 0,
+      off_target_note: misses.length ? misses.join("; ") : null,
+    };
+  }
+
+  // Apply edited portions to the unsaved candidate (saved later via "Add to the box").
+  function applyEditsToCurrent(ingredients, total, misses) {
+    setCurrent((c) => (c ? { ...c, ingredients, ...macroFields(total, misses) } : c));
+  }
+
+  // Apply edited portions to a saved recipe (persist immediately).
+  function saveEditsToBox(id, ingredients, total, misses) {
+    return patchBoxRecipe(id, { ingredients, ...macroFields(total, misses) });
   }
 
   // ── styles ───────────────────────────────────────────────────────────────
@@ -581,7 +573,15 @@ export default function App() {
                   </div>
                 )}
 
-                {current && <RecipeCard r={current} onKeep={keep} keepLabel="Add to the box" />}
+                {current && (
+                  <RecipeCard
+                    r={current}
+                    onKeep={keep}
+                    keepLabel="Add to the box"
+                    onApplyEdits={(ings, total, misses) => applyEditsToCurrent(ings, total, misses)}
+                    applyEditsLabel="Use these amounts"
+                  />
+                )}
               </>
             )}
 
@@ -592,6 +592,7 @@ export default function App() {
                 onSetTags={(id, tags) => patchBoxRecipe(id, { tags })}
                 onDelete={removeBoxRecipe}
                 onReroll={rerollFromBox}
+                onSaveEdits={saveEditsToBox}
               />
             )}
           </>
@@ -652,7 +653,7 @@ const STATUSES = [
 ];
 const statusLabel = (s) => (STATUSES.find((x) => x.key === s) || STATUSES[0]).label;
 
-function BoxTab({ box, onSetStatus, onSetTags, onDelete, onReroll }) {
+function BoxTab({ box, onSetStatus, onSetTags, onDelete, onReroll, onSaveEdits }) {
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("all");
@@ -712,21 +713,25 @@ function BoxTab({ box, onSetStatus, onSetTags, onDelete, onReroll }) {
           onSetTags={onSetTags}
           onDelete={onDelete}
           onReroll={onReroll}
+          onApplyEdits={(ings, total, misses) => onSaveEdits(r.id, ings, total, misses)}
+          applyEditsLabel="Save changes"
         />
       ))}
     </>
   );
 }
 
-function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, onReroll }) {
+function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, onReroll, onApplyEdits, applyEditsLabel }) {
   const isBoxed = Boolean(onSetStatus || onDelete || onReroll);
   const fiber = r.actual_fiber_g;
   const [showBreakdown, setShowBreakdown] = useState(false);
+  const [showEditor, setShowEditor] = useState(false);
   const [showReroll, setShowReroll] = useState(false);
   const [rerollNote, setRerollNote] = useState("");
   const [tagInput, setTagInput] = useState("");
   const ings = r.ingredients || [];
   const hasContrib = ings.some((i) => i.contributes);
+  const canEdit = Boolean(onApplyEdits) && ings.some((i) => i.per100g) && r.target_calories != null;
   const status = r.status || "untried";
 
   function addTag() {
@@ -774,17 +779,31 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
         </div>
       ))}
 
-      {hasContrib && (
-        <>
-          <button
-            className="btn ghost"
-            style={{ marginTop: 10, padding: "6px 12px", fontSize: 13 }}
-            onClick={() => setShowBreakdown((v) => !v)}
-          >
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+        {hasContrib && (
+          <button className="btn ghost" style={{ padding: "6px 12px", fontSize: 13 }} onClick={() => setShowBreakdown((v) => !v)}>
             {showBreakdown ? "Hide macro breakdown" : "Show macro breakdown"}
           </button>
-          {showBreakdown && <MacroBreakdown ings={ings} r={r} />}
-        </>
+        )}
+        {canEdit && (
+          <button className="btn ghost" style={{ padding: "6px 12px", fontSize: 13 }} onClick={() => setShowEditor((v) => !v)}>
+            {showEditor ? "Done adjusting" : "Adjust portions"}
+          </button>
+        )}
+      </div>
+      {hasContrib && showBreakdown && <MacroBreakdown ings={ings} r={r} />}
+      {canEdit && showEditor && (
+        <PortionEditor
+          ings={ings}
+          targets={{
+            calories: r.target_calories,
+            protein_g: r.target_protein_g,
+            carbs_g: r.target_carbs_g,
+            fiber_g: r.target_fiber_g,
+          }}
+          applyLabel={applyEditsLabel || "Use these amounts"}
+          onApply={(newIngs, total, misses) => { onApplyEdits(newIngs, total, misses); setShowEditor(false); }}
+        />
       )}
 
       <h3 style={{ marginBottom: 6, marginTop: 16 }}>Method</h3>
@@ -877,6 +896,85 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
 // Per-ingredient macro contributions + a totals row, for spot-checking accuracy.
 // `contributes` comes straight from grounding (recomputed by the solver after
 // portioning), so this is the authoritative per-ingredient math, not a re-estimate.
+// Live portion editor: change a gram weight and watch the macros update instantly
+// (pure per-100g math, no API call). "Rebalance the rest" holds the ingredients
+// you've edited and solves the others to the targets, the precision engine again,
+// just with some ingredients pinned.
+function PortionEditor({ ings, targets, applyLabel, onApply }) {
+  const orig = ings.map((i) => Math.round(i.grams_cooked || 0));
+  const [grams, setGrams] = useState(orig);
+  const [held, setHeld] = useState(() => new Set()); // indices the user pinned
+
+  const total = totalsFromGrams(ings, grams);
+  const within = {
+    calories: Math.abs(total.kcal - targets.calories) <= TOL.calories,
+    protein_g: Math.abs(total.protein - targets.protein_g) <= TOL.protein_g,
+    carbs_g: Math.abs(total.carbs - targets.carbs_g) <= TOL.carbs_g,
+    fiber_g: total.fiber >= targets.fiber_g - TOL.fiber_g,
+  };
+
+  function setGram(i, val) {
+    const n = Math.max(0, Math.round(+val || 0));
+    setGrams((g) => g.map((x, j) => (j === i ? n : x)));
+    setHeld((h) => new Set(h).add(i)); // editing pins it
+  }
+  function rebalance() {
+    const seeded = applyGrams(ings, grams); // bounds/locks read current grams
+    const solved = solvePortions(seeded, targets, { locked: [...held] });
+    setGrams(solved.grams);
+  }
+  function reset() {
+    setGrams(orig);
+    setHeld(new Set());
+  }
+  function apply() {
+    const newIngs = applyGrams(ings, grams);
+    const t = totalsFromGrams(ings, grams);
+    onApply(newIngs, t, offTarget(t, targets));
+  }
+
+  const stat = (ok) => ({ color: ok ? "#3a5a28" : "#9c3d2e", fontWeight: 600 });
+
+  return (
+    <div className="card" style={{ background: "#f4ede1", marginTop: 12 }}>
+      <h3 style={{ marginTop: 0, marginBottom: 4 }}>Adjust portions</h3>
+      <p className="note" style={{ marginTop: 0 }}>
+        Edit a weight to see macros update live. Edited ingredients are held; "Rebalance
+        the rest" solves the others to your targets.
+      </p>
+
+      {ings.map((i, n) => (
+        <div key={n} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
+          <input
+            type="number"
+            min="0"
+            value={grams[n]}
+            onChange={(e) => setGram(n, e.target.value)}
+            style={{ width: 72, padding: "5px 8px", border: "1.5px solid #d8c9ad", borderRadius: 3, fontFamily: "'Spline Sans'", fontSize: 14, background: "#fff" }}
+          />
+          <span style={{ fontSize: 11, color: "#8a7a5c" }}>g</span>
+          <span style={{ flex: 1, fontSize: 14 }}>{i.name}</span>
+          {held.has(n) && <span className="pill" style={{ background: "#2b2622", color: "#f4ede1" }}>held</span>}
+        </div>
+      ))}
+
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", margin: "14px 0 4px", fontSize: 13 }}>
+        <span style={stat(within.calories)}>{Math.round(total.kcal)} kcal <span style={{ color: "#8a7a5c", fontWeight: 400 }}>/ {targets.calories}</span></span>
+        <span style={stat(within.protein_g)}>{total.protein.toFixed(1)}g P <span style={{ color: "#8a7a5c", fontWeight: 400 }}>/ {targets.protein_g}</span></span>
+        <span style={stat(within.carbs_g)}>{total.carbs.toFixed(1)}g C <span style={{ color: "#8a7a5c", fontWeight: 400 }}>/ {targets.carbs_g}</span></span>
+        <span style={stat(within.fiber_g)}>{total.fiber.toFixed(1)}g fiber <span style={{ color: "#8a7a5c", fontWeight: 400 }}>/ {targets.fiber_g}</span></span>
+        <span style={{ color: "#8a7a5c" }}>{total.fat.toFixed(1)}g fat</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+        <button className="btn" style={{ padding: "8px 14px", fontSize: 13 }} onClick={rebalance}>Rebalance the rest to targets</button>
+        <button className="btn ghost" style={{ padding: "8px 14px", fontSize: 13 }} onClick={apply}>{applyLabel}</button>
+        <button className="btn ghost" style={{ padding: "8px 14px", fontSize: 13 }} onClick={reset}>Reset</button>
+      </div>
+    </div>
+  );
+}
+
 function MacroBreakdown({ ings, r }) {
   const n1 = (x) => (x == null ? "—" : (Math.round(x * 10) / 10).toString());
   const sum = (k) => ings.reduce((s, i) => s + (i.contributes?.[k] || 0), 0);
