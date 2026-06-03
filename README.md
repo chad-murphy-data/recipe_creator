@@ -86,6 +86,9 @@ handling).
   Netlify function (`netlify/functions/claude.mjs`) for production. It holds the
   Anthropic key, fixes the model (`claude-sonnet-4-6`), and enforces the app
   password. None of that reaches the browser.
+- A second password-gated endpoint (`server/recipes.js` -> `/api/recipes`) holds
+  the Supabase **service** key and is the only way the browser touches the
+  `recipes` table, so the database is never reachable with the public key.
 
 ## Prerequisites
 
@@ -118,11 +121,14 @@ A shared password keeps random visitors from burning your Anthropic spend.
 - The entered password is kept in the browser session only and sent with each
   request for the server to verify.
 
-What it does not cover: the `recipes` table is still reachable directly with the
-public anon key (read and insert), so the gate deters casual visitors but is not
-a hard lock on the database. Tightening that means real auth or routing writes
-through the server with the service role key. Worth doing if this goes beyond a
-personal tool.
+What it does not cover: the password is a single shared secret, not per-user
+login. It is not the database's lock, though: the `recipes` table is locked down
+(RLS on, no anon policies), and the browser reaches it only through the
+password-gated `/api/recipes`, which uses the Supabase service key server-side.
+So the public key in the bundle cannot read or change the box. The one
+intentionally open surface is the `usda-ground` edge function (no password, no
+database, only free USDA quota). Real per-user auth is only worth adding if this
+is ever shared beyond one person.
 
 ## Deploy to Netlify
 
@@ -133,6 +139,10 @@ variables):
 
 - `ANTHROPIC_API_KEY` (required; powers the recipe proxy).
 - `APP_PASSWORD` (optional; turns on the lock screen).
+- `SUPABASE_SERVICE_KEY` (the `sb_secret_...` service-role key; lets `/api/recipes`
+  reach the locked-down table. Required now that RLS is closed to the public key.
+  Server-side only: never give a `VITE_`-prefixed var a secret value, it gets
+  bundled into the public site).
 - `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (optional; the app falls back to
   the public defaults baked into the code if unset).
 
@@ -144,10 +154,12 @@ variables):
    project `nwgxyytowbluuykbdcfc` > Edge Functions > Secrets > `USDA_API_KEY`. Or
    via CLI: `supabase secrets set USDA_API_KEY=... --project-ref nwgxyytowbluuykbdcfc`.
    Free key: https://fdc.nal.usda.gov/api-key-signup.html
-2. **RLS is permissive.** The `recipes` table allows public read, insert, update,
-   and delete via the anon key (no user login). This is what makes the box
-   editable for a private demo, but it means anyone with the URL can change or
-   delete recipes. Add real auth and per-user rows before sharing it (Phase 4).
+2. **No per-user auth (single shared password).** The `recipes` table is locked
+   down: RLS on with no anon policies, so the public key can't touch it. The
+   browser reads and writes only through the password-gated `/api/recipes`, which
+   holds the Supabase service key server-side. What remains is that everyone shares
+   one password instead of logging in; add real auth and per-user rows only if this
+   is ever shared beyond one person.
 3. **Ingredient matching** validates that the chosen USDA entry contains the
    Generator's `match` term and searches Foundation, SR Legacy, and Survey
    (FNDDS), then **USDA Branded** (real label data) as a fallback for foods the
