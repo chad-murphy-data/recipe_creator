@@ -15,7 +15,13 @@ appears to work.
    ingredient, `{name, usdaQuery, match, role, grams}`. Code does the USDA lookup
    and the arithmetic. Never let the model emit macro numbers, and never trust a
    model-supplied USDA `fdcId` (it hallucinates plausible-but-wrong IDs, which is
-   worse than a search because it looks authoritative).
+   worse than a search because it looks authoritative). **One deliberate
+   exception:** a food USDA does not contain at *any* tier (Foundation, SR Legacy,
+   FNDDS, or Branded), e.g. some imported pastes, gets a model-estimated per-100g
+   vector so a good recipe isn't lost. It is always flagged (`estimated: true` on
+   the ingredient, an "estimated" pill, and "not USDA" in the UI) and never shown
+   as a USDA number. Code still does the gram arithmetic on the estimate. See
+   `src/estimate.js`.
 2. **Code owns the portions.** `src/solver.js` solves the gram weights (bounded
    least-squares) to hit the targets within tolerance, inside sane per-role
    bounds. The model designs the dish; code sets the amounts. Do not revert to
@@ -24,9 +30,14 @@ appears to work.
    recipe is saved and shown flagged (`on_target = false`, a "macros off" pill +
    the specific miss), not passed off as good.
 4. **Never substitute the wrong food.** The chosen USDA entry must contain the
-   generator's `match` term (`descMatches` in the edge function). If nothing
-   matches, fail loudly naming the ingredient. This is what stopped "edamame"
-   silently resolving to "Asparagus, cooked."
+   generator's `match` term (`descMatches` in the edge function). This is what
+   stopped "edamame" silently resolving to "Asparagus, cooked." When the generic
+   datasets have no match, grounding tries **USDA Branded** (real label data) next.
+   Only a food absent from *every* tier becomes a flagged estimate, and a food we
+   can't even estimate is swapped out by the generator (the client re-grounds
+   ingredient-by-ingredient so one miss never sinks the whole batch). A *wrong*
+   match is still a loud failure; an *absent* food is a flagged estimate or a
+   swap, never a silent substitution.
 5. **Match the prep.** Raw mode uses raw weights and raw USDA entries; cooked uses
    cooked. Never mix (raw grams against a cooked entry gives wrong macros).
 6. **The judge is blind.** The palatability judge sees the recipe but no macro
@@ -49,7 +60,14 @@ appears to work.
    gram weight. Raw or cooked per the toggle.
 2. **Grounding** (Supabase edge function `usda-ground`) searches USDA, validates
    the `match`, prefers the requested prep, and returns each ingredient's
-   per-100g macros. Charlie's staples pin known-good FDC IDs (cooked mode only).
+   per-100g macros. Tiers: Foundation/SR Legacy/FNDDS first, then **Branded**
+   (real manufacturer-label data) for foods the generic sets lack (gochujang,
+   specific sauces). Charlie's staples pin known-good FDC IDs (cooked mode only).
+2b. **Resilient recovery + estimate** (client, `groundAndEstimate` in `App.jsx`):
+   if the batch call fails on one stubborn food, re-ground each ingredient alone so
+   the matches survive, then model-**estimate** the genuine misses (flagged, not
+   USDA). A food that can't be matched or estimated is handed to step 4 for a swap.
+   So one missing ingredient never errors the whole recipe.
 3. **Solve** (`src/solver.js`) computes the exact gram weights to hit the targets
    within bounds. Deterministic (same recipe solves the same way).
 4. **Swap, only if infeasible** (cap 4): if no portioning works, the ingredient
@@ -65,6 +83,11 @@ appears to work.
 - `src/solver.js` — the precision engine: portion solver, tolerances (`TOL`),
   `applyGrams`, `offTarget`. Tested in `src/solver.test.js`.
 - `src/staples.js` — pinned USDA FDC IDs for staple foods. Tested.
+- `src/taste.js` — turns the saved box into a generator signal (liked → lean,
+  disliked → avoid, recent → don't repeat). Shapes the dish only, never macros.
+  Tested.
+- `src/estimate.js` — builds a flagged, grounded-shaped ingredient from a model
+  estimate, for foods absent from every USDA tier. Tested.
 - `server/claude.js` — `/api/claude`: password gate + spend cap + Anthropic call.
   Model `claude-sonnet-4-6`, `max_tokens` 2000.
 - `server/recipes.js` — `/api/recipes`: password-gated DB access with the service
@@ -74,8 +97,9 @@ appears to work.
   mirrors both as dev middleware so `npm run dev` behaves like production.
 - `supabase/functions/usda-ground/index.ts` — the grounding edge function (Deno).
   Deployed to Supabase; keep this file in sync with the deployed version.
-- Tests: `npm test` (Node's built-in runner, no extra deps). 38 tests across the
-  solver, staples, recipes endpoint, rate limiter, and the proxy.
+- Tests: `npm test` (Node's built-in runner, no extra deps). 52 tests across the
+  solver, staples, taste signal, estimate fallback, recipes endpoint, rate
+  limiter, and the proxy.
 
 ## Deployed infrastructure
 

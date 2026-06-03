@@ -17,11 +17,11 @@ const isRaw = (d: string) => (d ?? "").toLowerCase().split(/[^a-z0-9]+/).include
 // array value. (As a query-string param its parentheses make USDA return 400.)
 // FNDDS is where entries like "Edamame, prepared" live, alongside Foundation
 // and SR Legacy.
-async function search(query: string) {
+async function search(query: string, dataType = ["Foundation", "SR Legacy", "Survey (FNDDS)"]) {
   const r = await fetch(`https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${USDA_KEY}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, dataType: ["Foundation", "SR Legacy", "Survey (FNDDS)"], pageSize: 25 }),
+    body: JSON.stringify({ query, dataType, pageSize: 25 }),
   });
   if (!r.ok) throw new Error(`USDA search failed (${r.status}) for "${query}"`);
   const d = await r.json();
@@ -81,6 +81,8 @@ Deno.serve(async (req: Request) => {
     const total = { kcal:0, protein:0, fat:0, carbs:0, fiber:0 };
     for (const ing of ingredients) {
       let chosen: any;
+      let chosenMacros: any = null; // set when a tier already fetched the macros
+      let branded = false;
       if (ing.fdcId) {
         // 0) Pinned staple: fetch the exact curated entry, no search. The macros
         //    fetch carries the description, so we trust the caller's pin.
@@ -96,12 +98,26 @@ Deno.serve(async (req: Request) => {
           hits = await search(ing.match);
           chosen = selectHit(hits, ing.match, prep);
         }
+        // 3) Branded fallback. Foods the generic datasets don't carry (gochujang,
+        //    specific sauces/pastes) usually live in USDA's Branded label database.
+        //    Still real USDA numbers, just from manufacturer labels, so macros stay
+        //    code-owned and source-true. Searched only as a fallback so the huge
+        //    Branded set can't bury good generic matches, and we skip any label
+        //    that's missing calories (sparse branded rows happen).
+        if (!chosen && ing.match) {
+          const brandedHits = await search(ing.match, ["Branded"]);
+          const candidates = brandedHits.filter((h: any) => descMatches(h.description, ing.match)).slice(0, 6);
+          for (const c of candidates) {
+            const m = await macros(c.fdcId);
+            if ((m.kcal ?? 0) > 0) { chosen = c; chosenMacros = m; branded = true; break; }
+          }
+        }
         if (!chosen) {
           const seen = hits.slice(0, 3).map((h: any) => h.description).join(" | ");
           throw new Error(`No USDA entry matching "${ing.match ?? ing.usdaQuery}" for "${ing.name}". Top hits were: ${seen}`);
         }
       }
-      const per100 = await macros(chosen.fdcId);
+      const per100 = chosenMacros ?? await macros(chosen.fdcId);
       // For pinned entries, fill the description from the fetched food.
       if (!chosen.description) chosen.description = per100.description;
       const f = (ing.grams ?? 0) / 100;
@@ -112,7 +128,7 @@ Deno.serve(async (req: Request) => {
       for (const k of Object.keys(total) as (keyof typeof total)[]) total[k] += (contributes as any)[k];
       grounded.push({
         name: ing.name, grams_cooked: ing.grams, fdcId: chosen.fdcId,
-        fdcDescription: chosen.description, per100g: per100, contributes,
+        fdcDescription: chosen.description, per100g: per100, contributes, branded,
       });
     }
     return new Response(JSON.stringify({ grounded, total }), {
