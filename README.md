@@ -4,6 +4,12 @@ A macro-precise dinner recipe generator with a saved recipe box. Macros are
 computed in code from USDA FoodData Central, never guessed by the model, and a
 blind palatability judge approves on taste alone so the food stays edible.
 
+> **This is a personal app.** The only user is Charlie (one person), and it is
+> not in daily use yet. There is no real risk in testing against production, and
+> any change can be reverted, so prefer shipping and verifying on the live
+> preview or prod over building elaborate staging. (Secrets still stay
+> server-side regardless; see the password gate and deploy notes below.)
+
 ## How it works
 
 Per request the app runs this pipeline:
@@ -142,11 +148,14 @@ variables):
    and delete via the anon key (no user login). This is what makes the box
    editable for a private demo, but it means anyone with the URL can change or
    delete recipes. Add real auth and per-user rows before sharing it (Phase 4).
-3. **Ingredient matching** now validates that the chosen USDA entry contains the
+3. **Ingredient matching** validates that the chosen USDA entry contains the
    Generator's `match` term and searches Foundation, SR Legacy, and Survey
-   (FNDDS). If nothing matches, that ingredient fails loudly instead of resolving
-   to the wrong food. A curated table of staple foods mapped to known-good FDC IDs
-   is the natural next layer for Charlie's regulars.
+   (FNDDS), then **USDA Branded** (real label data) as a fallback for foods the
+   generic sets lack (gochujang, specific sauces). A food absent from every USDA
+   tier falls back to a clearly-flagged model estimate, and one that can't even be
+   estimated is swapped, so a single odd ingredient never errors the whole recipe.
+   Curated staple foods mapped to known-good FDC IDs (`src/staples.js`) skip the
+   search for Charlie's regulars.
 
 ## Demo parameters
 
