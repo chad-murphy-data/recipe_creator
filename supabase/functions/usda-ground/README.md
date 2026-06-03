@@ -15,12 +15,19 @@ directly to Supabase; keep this file in sync with the deployed version.
 - Otherwise it searches the detailed `usdaQuery` first, then falls back to the
   bare `match` noun if the food doesn't surface (a noisy query like "shelled
   edamame cooked" buries the real entry under generic "cooked" vegetables).
+- If the generic datasets still have no match, it tries **Branded** as a final
+  tier: real USDA manufacturer-label data, where foods like gochujang and specific
+  sauces/pastes live. Branded is searched only as a fallback (the dataset is huge
+  and would otherwise bury good generic matches), and a branded hit whose label is
+  missing calories is skipped. Branded entries come back with `branded: true`.
 - Requires the chosen entry's description to contain the `match` term, prefers a
   cooked/prepared form, and avoids raw. Fails loudly (naming the ingredient)
-  rather than substituting a wrong food.
-- Searches Foundation, SR Legacy, and Survey (FNDDS) via the POST endpoint.
-  FNDDS must go through POST: as a query-string `dataType` value its parentheses
-  make the search endpoint return 400.
+  rather than substituting a wrong food. The client treats that failure as
+  recoverable (it re-grounds per ingredient and estimates the genuine miss), so a
+  loud failure here no longer kills the whole recipe.
+- Searches Foundation, SR Legacy, and Survey (FNDDS) via the POST endpoint, plus
+  Branded as the fallback tier. FNDDS must go through POST: as a query-string
+  `dataType` value its parentheses make the search endpoint return 400.
 
 ## Deploy config (not captured in the source)
 

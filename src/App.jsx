@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import { solvePortions, applyGrams, totalsFromGrams, offTarget, TOL } from "./solver.js";
 import { resolveStaple } from "./staples.js";
+import { tasteProfile, tastePromptSection, EMPTY_TASTE } from "./taste.js";
+import { estimatedEntry } from "./estimate.js";
 
 // ─────────────────────────────────────────────────────────────────────────
 //  Charlie's Recipe Box
@@ -105,7 +107,7 @@ function parseJSON(text) {
 // The model designs the DISH. It does not have to nail the macros: code solves
 // the exact gram weights afterward. Its grams are just a sensible starting point,
 // and its "role" tags tell the solver how far each ingredient may be adjusted.
-async function generateRecipe(targets, prefs, feedback, avoidTitles, prep) {
+async function generateRecipe(targets, prefs, feedback, taste, prep) {
   const raw = prep === "raw";
   const weightWord = raw ? "RAW (uncooked) gram weight" : "COOKED gram weight";
   const queryHint = raw
@@ -132,13 +134,11 @@ Respond ONLY with JSON, no prose, no backticks:
   "steps": ["step 1","step 2"]
 }`;
 
-  // Variety nudge: the inputs are otherwise identical every run, so the model
-  // keeps landing on the same obvious dish (umami + chicken = miso chicken).
-  // Showing it what to avoid breaks the loop without touching the targets.
-  const avoid = (avoidTitles || []).filter(Boolean).slice(0, 8);
-  const variety = avoid.length
-    ? `\nMake something genuinely DIFFERENT from these recent recipes (vary the cuisine and the main protein, do not just rename): ${avoid.join("; ")}.`
-    : "";
+  // Taste signal: the box teaches the generator. Liked dishes pull toward their
+  // style, disliked push away, and recent ones keep it from reissuing the same
+  // meal (the old "miso chicken every time" loop). This only shapes the DISH;
+  // code still solves the macros and the judge stays blind, so no guardrail moves.
+  const variety = tastePromptSection(taste);
 
   const user = `Targets (per serving): ${targets.calories} kcal, ${targets.protein_g}g protein, ${targets.carbs_g}g carbs, ${targets.fiber_g}g fiber.
 Weights are ${raw ? "RAW" : "COOKED"}.
@@ -171,19 +171,99 @@ ${recipe.steps.map((s, n) => `${n + 1}. ${s}`).join("\n")}`;
 // how far it may adjust each amount (the edge function doesn't echo role back).
 // Staples resolve to a pinned fdcId (COOKED entries), so they only apply in
 // cooked mode; raw mode falls through to the prep-aware search.
-async function groundRecipe(recipe, sb, log, prep) {
+// Get a per-100g macro vector for EVERY ingredient, however we can, so one
+// stubborn food doesn't sink the recipe. Order of preference:
+//   1. One batched USDA call (the fast, normal path). The edge function itself
+//      now tries Foundation/SR/FNDDS and then USDA Branded, so exotic condiments
+//      like gochujang resolve here as real USDA data.
+//   2. If the batch throws (a food USDA truly lacks at any tier), re-ground each
+//      ingredient on its own so the matches survive, and collect the misses.
+//   3. Estimate the genuine misses (flagged "not USDA"); whatever can't even be
+//      estimated comes back in `unresolved` for the caller to swap out.
+async function groundAndEstimate(recipe, sb, log, prep, onPhase) {
   log(`  Sending ${recipe.ingredients.length} ingredients to USDA grounding (${prep})…`);
   const payload = recipe.ingredients.map((i) => {
     const pin = prep === "cooked" ? resolveStaple(i.match) : null;
     if (pin) log(`    · ${i.name}: pinned to ${pin.label} (FDC ${pin.fdcId})`);
     return { name: i.name, usdaQuery: i.usdaQuery, grams: i.grams, match: i.match, fdcId: pin?.fdcId };
   });
-  const { grounded, total } = await groundViaEdge(sb, payload, prep);
-  grounded.forEach((g, idx) => {
-    if (recipe.ingredients[idx]) g.role = recipe.ingredients[idx].role;
-  });
-  for (const g of grounded) log(`    → ${g.name}: ${g.fdcDescription} (FDC ${g.fdcId})`);
-  return { grounded, total };
+
+  const byIndex = new Map(); // original index -> grounded ingredient
+  const missingIdx = [];
+  const note = (g) =>
+    log(`    → ${g.name}: ${g.fdcDescription} (FDC ${g.fdcId})${g.branded ? " · branded" : ""}`);
+
+  try {
+    const { grounded } = await groundViaEdge(sb, payload, prep);
+    grounded.forEach((g, idx) => {
+      g.role = recipe.ingredients[idx]?.role;
+      byIndex.set(idx, g);
+      note(g);
+    });
+  } catch (batchErr) {
+    log(`  Batch grounding failed (${batchErr.message}). Grounding ingredient-by-ingredient…`);
+    const settled = await Promise.allSettled(payload.map((p) => groundViaEdge(sb, [p], prep)));
+    settled.forEach((res, idx) => {
+      const g = res.status === "fulfilled" ? res.value.grounded?.[0] : null;
+      if (g) {
+        g.role = recipe.ingredients[idx]?.role;
+        byIndex.set(idx, g);
+        note(g);
+      } else {
+        missingIdx.push(idx);
+      }
+    });
+    // Nothing matched at all: this isn't one exotic food, it's a real outage
+    // (network / USDA down / bad key). Surface it rather than "estimating" the
+    // whole dinner.
+    if (byIndex.size === 0) throw batchErr;
+  }
+
+  // Estimate the genuinely-absent foods (flagged, not USDA).
+  const estimatedNames = [];
+  const unresolved = [];
+  if (missingIdx.length) {
+    onPhase?.("estimating");
+    log(`  Not in USDA: ${missingIdx.map((i) => recipe.ingredients[i].name).join(", ")}. Estimating (flagged, not USDA)…`);
+    let estimates = [];
+    try {
+      estimates = await estimateMacros(missingIdx.map((i) => recipe.ingredients[i]), prep);
+    } catch (e) {
+      log(`  Estimation call failed (${e.message}).`);
+    }
+    missingIdx.forEach((idx, k) => {
+      const ing = recipe.ingredients[idx];
+      const entry = estimatedEntry(ing, estimates[k]);
+      if (entry) {
+        byIndex.set(idx, entry);
+        estimatedNames.push(ing.name);
+        log(`    ~ ${ing.name}: ${entry.per100g.kcal} kcal/100g (estimated, not USDA)`);
+      } else {
+        unresolved.push(ing.name);
+        log(`    ✗ ${ing.name}: couldn't estimate.`);
+      }
+    });
+  }
+
+  // Reassemble in the original ingredient order (resolved ones only).
+  const grounded = [];
+  for (let i = 0; i < recipe.ingredients.length; i++) {
+    if (byIndex.has(i)) grounded.push(byIndex.get(i));
+  }
+  return { grounded, estimatedNames, unresolved };
+}
+
+// Ask the model for per-100g macros for foods USDA lacks at every tier. These
+// are shown clearly labeled as estimates; this is the one place a macro number
+// comes from the model, and only for foods USDA genuinely does not contain.
+async function estimateMacros(ingredients, prep) {
+  const system = `You estimate nutrition for foods that are NOT in USDA FoodData Central. For each food, give TYPICAL macros per 100 grams of the food in its ${prep} form, using well-established nutrition values. These will be shown to the user clearly labeled as estimates.
+Respond ONLY with JSON, no prose, no backticks:
+{"estimates":[{"name":"<echo the food name>","kcal":number,"protein":number,"fat":number,"carbs":number,"fiber":number}]}`;
+  const user = `Foods (give macros per 100 g, ${prep} form):\n${ingredients.map((i) => `- ${i.name}`).join("\n")}`;
+  const parsed = parseJSON(await callClaude(system, user));
+  const arr = Array.isArray(parsed?.estimates) ? parsed.estimates : [];
+  return ingredients.map((_, k) => arr[k]); // align by request order
 }
 
 // ── Recipes via the server (/api/recipes) ───────────────────────────────────
@@ -217,6 +297,7 @@ export default function App() {
   const [prep, setPrep] = useState("raw"); // weigh ingredients raw (default) or cooked
 
   const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState("idle"); // drives the cooking-chef caption
   const [logLines, setLogLines] = useState([]);
   const [current, setCurrent] = useState(null);
   const [box, setBox] = useState([]);
@@ -261,6 +342,14 @@ export default function App() {
     }
   }
 
+  // Load the box as soon as we're in, so the Make tab's taste signal (and the
+  // variety nudge) are ready on the very first generate, not only after the
+  // user has visited The Box tab.
+  useEffect(() => {
+    if (unlocked) refreshBox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unlocked]);
+
   async function run(opts = {}) {
     const { rerollNote = "", baseRecipe = null } = opts;
     setErr("");
@@ -271,10 +360,10 @@ export default function App() {
     try {
       const isReroll = Boolean(baseRecipe);
 
-      // A reroll TWEAKS the existing dish, so variety is OFF (we want to keep it,
-      // not avoid it) and we seed the model with the current recipe. A fresh make
-      // turns variety ON: avoid repeating what's already in the box.
-      const avoidTitles = isReroll ? [] : box.map((b) => b.title);
+      // The box teaches the generator: liked -> lean toward, disliked -> steer
+      // clear, recent -> don't repeat. A reroll is a targeted tweak of one dish,
+      // so it carries no taste profile (we want to keep that dish, not vary it).
+      const taste = isReroll ? EMPTY_TASTE : tasteProfile(box);
 
       // baseFeedback persists across swap rounds so the "keep this dish" intent
       // (or the change request) isn't lost when macro-miss feedback is appended.
@@ -296,33 +385,57 @@ export default function App() {
       let recipe = null;
       let grounded = null;
       let solved = null;
+      let estimatedNames = []; // foods we fell back to a flagged estimate for
+      // The last round that produced a full grounded set + a solve. We keep this
+      // (not whatever the latest round left behind) so an unresolved swap attempt
+      // can't strand a stale grounded/solved pair.
+      let committed = null;
 
-      // ── Generate -> ground -> SOLVE. Code owns the portions. We only loop
-      //    back to the model when the ingredient SET can't hit the targets at
-      //    any portioning (then it swaps an ingredient, not re-guesses grams).
+      // ── Generate -> ground -> SOLVE. Code owns the portions. We loop back to
+      //    the model in two cases: the ingredient SET can't hit the targets at
+      //    any portioning (swap for macros), or a food can't be grounded OR
+      //    estimated (swap it for something findable). One missing food no longer
+      //    sinks the whole recipe.
       for (let round = 1; round <= MAX_SWAP_ROUNDS; round++) {
+        setPhase("generating");
         log(round === 1 ? `Generator…` : `Generator — swapping an ingredient (round ${round})…`);
-        recipe = await generateRecipe(targets, prefs, feedback, avoidTitles, activePrep);
+        recipe = await generateRecipe(targets, prefs, feedback, taste, activePrep);
+        setPhase("grounding");
         log(`Proposed: "${recipe.title}". Grounding in USDA…`);
-        ({ grounded } = await groundRecipe(recipe, sb, log, activePrep));
+        const ground = await groundAndEstimate(recipe, sb, log, activePrep, setPhase);
 
+        // A food we couldn't match anywhere OR estimate: the set needs a swap.
+        if (ground.unresolved.length) {
+          log(`✗ Couldn't ground or estimate: ${ground.unresolved.join(", ")}. Asking for a swap…`);
+          const swapMsg = `These ingredients couldn't be found in USDA (any dataset) or reliably estimated: ${ground.unresolved.join(
+            ", "
+          )}. Replace each with a common, widely available alternative that keeps the dish appealing. Do not just rename them.`;
+          feedback = [baseFeedback, swapMsg].filter(Boolean).join("\n\n");
+          if (round === MAX_SWAP_ROUNDS) log(`Reached swap cap with unresolved ingredients.`);
+          continue;
+        }
+        if (ground.estimatedNames.length) log(`  Estimated (not USDA): ${ground.estimatedNames.join(", ")}.`);
+
+        setPhase("solving");
         log(`Solving exact portions…`);
-        solved = solvePortions(grounded, targets);
-        for (const c of solved.changes) {
+        const sol = solvePortions(ground.grounded, targets);
+        for (const c of sol.changes) {
           if (c.from !== c.to) log(`    · ${c.name}: ${c.from}g → ${c.to}g`);
         }
         log(
-          `Solved totals: ${solved.total.kcal.toFixed(0)} kcal · ${solved.total.protein.toFixed(
+          `Solved totals: ${sol.total.kcal.toFixed(0)} kcal · ${sol.total.protein.toFixed(
             1
-          )}g P · ${solved.total.carbs.toFixed(1)}g C · ${solved.total.fiber.toFixed(1)}g fiber`
+          )}g P · ${sol.total.carbs.toFixed(1)}g C · ${sol.total.fiber.toFixed(1)}g fiber`
         );
 
-        if (solved.withinTolerance) {
+        committed = { recipe, grounded: ground.grounded, solved: sol, estimatedNames: ground.estimatedNames };
+
+        if (sol.withinTolerance) {
           log(`✓ Macros hit within tolerance.`);
           break;
         }
-        log(`✗ This ingredient set can't hit target: ${solved.misses.join("; ")}`);
-        const macroMiss = `Code adjusted the portions as far as it sensibly could and STILL could not hit the targets: ${solved.misses.join(
+        log(`✗ This ingredient set can't hit target: ${sol.misses.join("; ")}`);
+        const macroMiss = `Code adjusted the portions as far as it sensibly could and STILL could not hit the targets: ${sol.misses.join(
           "; "
         )}. The amounts are not the problem; the ingredient SET is. Swap in or add an ingredient that fixes this (e.g. a leaner/denser protein for a protein gap, beans or whole grains for a fiber gap) and keep the dish appetizing. Do not just change numbers.`;
         feedback = [baseFeedback, macroMiss].filter(Boolean).join("\n\n");
@@ -330,14 +443,26 @@ export default function App() {
           log(`Reached swap cap — keeping the closest version (flagged below).`);
       }
 
+      // Every round failed to even ground/estimate its ingredients. Surface it
+      // cleanly rather than crashing on a null solve.
+      if (!committed) {
+        throw new Error(
+          "Couldn't assemble a recipe whose ingredients resolve in USDA or as estimates after several tries. Try again, or adjust your preferences."
+        );
+      }
+      recipe = committed.recipe;
+      solved = committed.solved;
+      estimatedNames = committed.estimatedNames;
+
       // Lock in the solved portions on the grounded ingredients.
-      grounded = applyGrams(grounded, solved.grams);
+      grounded = applyGrams(committed.grounded, solved.grams);
       let total = solved.total;
 
       // ── Palatability (blind). A taste fix re-grounds AND re-solves so the
       //    macros can't silently drift off target.
       let verdict = { passes: true, note: "" };
       for (let t = 1; t <= MAX_TASTE_ROUNDS; t++) {
+        setPhase("tasting");
         log(`Palatability judge (blind) — round ${t}…`);
         verdict = await judgePalatability({ ...recipe, ingredients: grounded.map((g) => ({ name: g.name, grams: g.grams_cooked })) });
         if (verdict.passes) {
@@ -349,18 +474,32 @@ export default function App() {
           log(`Reached taste round cap — surfacing for your call.`);
           break;
         }
-        recipe = await generateRecipe(
+        setPhase("generating");
+        const revised = await generateRecipe(
           targets,
           prefs,
           `A taste reviewer flagged this: "${verdict.note}". Fix the appeal problem. Amounts will be re-tuned automatically, so focus on the dish itself.`,
-          avoidTitles,
+          // Keep variety so the fix isn't a near-dupe, but drop the like/dislike
+          // lean here: the specific taste note is what should drive this revision.
+          { liked: [], disliked: [], recent: taste.recent },
           activePrep
         );
-        log(`Revised for taste: "${recipe.title}". Re-grounding and re-solving…`);
-        ({ grounded } = await groundRecipe(recipe, sb, log, activePrep));
-        solved = solvePortions(grounded, targets);
-        grounded = applyGrams(grounded, solved.grams);
+        setPhase("grounding");
+        log(`Revised for taste: "${revised.title}". Re-grounding and re-solving…`);
+        const reg = await groundAndEstimate(revised, sb, log, activePrep, setPhase);
+        if (reg.unresolved.length) {
+          // The revision introduced something we can't ground or estimate. Don't
+          // commit it; keep the version we already have and stop revising.
+          log(`  Revision needs ${reg.unresolved.join(", ")}, which won't ground or estimate. Keeping the previous version.`);
+          break;
+        }
+        recipe = revised;
+        estimatedNames = reg.estimatedNames;
+        setPhase("solving");
+        solved = solvePortions(reg.grounded, targets);
+        grounded = applyGrams(reg.grounded, solved.grams);
         total = solved.total;
+        if (reg.estimatedNames.length) log(`  Estimated (not USDA): ${reg.estimatedNames.join(", ")}.`);
         if (!solved.withinTolerance) log(`  (note: ${solved.misses.join("; ")})`);
         log(
           `Re-solved: ${total.kcal.toFixed(0)} kcal · ${total.protein.toFixed(
@@ -390,9 +529,12 @@ export default function App() {
         off_target_note: onTarget ? null : solved.misses.join("; "),
         prep: activePrep,
       };
+      setPhase("done");
       setCurrent(result);
-      log(onTarget ? `Done.` : `Done, but macros are off (see above) — your call whether to keep.`);
+      const estNote = estimatedNames.length ? ` (estimated, not USDA: ${estimatedNames.join(", ")})` : "";
+      log(onTarget ? `Done.${estNote}` : `Done, but macros are off (see above) — your call whether to keep.${estNote}`);
     } catch (e) {
+      setPhase("error");
       setErr(e.message);
       log(`ERROR: ${e.message}`);
     } finally {
@@ -522,6 +664,23 @@ export default function App() {
     .chip-on { background:#2b2622; color:#f4ede1; border-color:#2b2622; }
     .field select { width:100%; padding:8px 10px; border:1.5px solid #d8c9ad; border-radius:3px;
       font-family:'Spline Sans'; font-size:14px; background:#fff; }
+    /* Cooking chef — the generation animation. Pure SVG/CSS, themed to the box. */
+    .chef-wrap { display:flex; flex-direction:column; align-items:center; gap:8px; padding:6px 0 14px; }
+    .chef { width:180px; height:auto; display:block; }
+    .chef-cap { font-family:'Fraunces',serif; font-style:italic; color:#8a7a5c; font-size:15px; min-height:1.3em; text-align:center; }
+    .chef-bob { animation: chefBob 2.6s ease-in-out infinite; }
+    .chef .steam { animation: steamRise 2.8s ease-in-out infinite; }
+    .chef .steam-b { animation-delay:0.7s; }
+    .chef .steam-c { animation-delay:1.4s; }
+    .chef .stir { transform-box: view-box; transform-origin: 110px 116px; animation: stir 1.9s ease-in-out infinite; }
+    .chef .sauce { animation: sauceWobble 1.9s ease-in-out infinite; }
+    @keyframes chefBob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+    @keyframes steamRise { 0% { opacity:0; transform: translateY(8px); } 35% { opacity:0.6; } 100% { opacity:0; transform: translateY(-14px); } }
+    @keyframes stir { 0%,100% { transform: rotate(-13deg); } 50% { transform: rotate(13deg); } }
+    @keyframes sauceWobble { 0%,100% { transform: translateX(-1.5px); } 50% { transform: translateX(1.5px); } }
+    @media (prefers-reduced-motion: reduce) {
+      .chef-bob, .chef .steam, .chef .stir, .chef .sauce { animation: none; }
+    }
   `;
 
   return (
@@ -592,12 +751,16 @@ export default function App() {
                   <button className="btn" disabled={!ready || busy} onClick={() => run()}>
                     {busy ? "Cooking up something…" : ready ? "Generate recipe" : "Supabase not configured"}
                   </button>
+                  <TasteHint box={box} />
                 </div>
 
-                {logLines.length > 0 && (
+                {(busy || logLines.length > 0) && (
                   <div className="card">
                     <h3 style={{ marginTop: 0 }}>Kitchen pass</h3>
-                    <div className="log" ref={logRef}>{logLines.join("\n")}</div>
+                    {busy && <CookingChef phase={phase} />}
+                    {logLines.length > 0 && (
+                      <div className="log" ref={logRef}>{logLines.join("\n")}</div>
+                    )}
                   </div>
                 )}
 
@@ -626,6 +789,81 @@ export default function App() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// A small line under the Generate button so the taste-learning is legible: it
+// tells Charlie the box is actually steering what gets made, not just archiving.
+function TasteHint({ box }) {
+  const liked = box.filter((r) => (r.status || "untried") === "liked").length;
+  const disliked = box.filter((r) => (r.status || "untried") === "disliked").length;
+  if (!liked && !disliked) return null;
+  const parts = [];
+  if (liked) parts.push(`leaning on ${liked} you liked`);
+  if (disliked) parts.push(`steering clear of ${disliked} you didn't`);
+  return (
+    <div className="note" style={{ marginTop: 10 }}>
+      Learning from your box: {parts.join(" and ")}.
+    </div>
+  );
+}
+
+// The cooking chef shown while the kitchen runs. Hand-built SVG + CSS (see the
+// .chef styles): no image asset, themed to the box's palette, and it honors
+// prefers-reduced-motion. The caption tracks the real pipeline phase, so the
+// animation is wired to the actual work rather than being a generic spinner.
+const CHEF_CAPTIONS = {
+  idle: "Warming the stove…",
+  generating: "Dreaming up a dish…",
+  grounding: "Weighing it against USDA…",
+  estimating: "Looking up an off-menu ingredient…",
+  solving: "Solving the exact grams…",
+  tasting: "Giving it a taste…",
+  done: "Plating up…",
+  error: "Something boiled over.",
+};
+
+function CookingChef({ phase }) {
+  const caption = CHEF_CAPTIONS[phase] || CHEF_CAPTIONS.idle;
+  return (
+    <div className="chef-wrap">
+      <svg className="chef" viewBox="0 0 220 180" role="img" aria-label="A chef stirring a pot">
+        <g className="chef-bob">
+          {/* apron/chest, mostly hidden behind the pot */}
+          <rect x="86" y="78" width="48" height="62" rx="14" fill="#9c3d2e" stroke="#2b2622" strokeWidth="2.5" />
+          {/* toque */}
+          <circle cx="96" cy="34" r="13" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          <circle cx="124" cy="34" r="13" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          <circle cx="110" cy="26" r="15" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          <rect x="90" y="40" width="40" height="14" rx="4" fill="#fffdf8" stroke="#2b2622" strokeWidth="2.5" />
+          {/* head + face */}
+          <circle cx="110" cy="64" r="20" fill="#f3d7b0" stroke="#2b2622" strokeWidth="2.5" />
+          <circle cx="103" cy="62" r="2.2" fill="#2b2622" />
+          <circle cx="117" cy="62" r="2.2" fill="#2b2622" />
+          <path d="M103 72 Q110 78 117 72" fill="none" stroke="#2b2622" strokeWidth="2" strokeLinecap="round" />
+          <circle cx="99" cy="70" r="2.6" fill="#d98a6a" opacity="0.5" />
+          <circle cx="121" cy="70" r="2.6" fill="#d98a6a" opacity="0.5" />
+          {/* steam (drawn before the pot so it appears to rise out of it) */}
+          <g fill="none" stroke="#cbb89a" strokeWidth="3.2" strokeLinecap="round">
+            <path className="steam steam-a" d="M92 116 q-5 -8 0 -16 q5 -8 0 -16" />
+            <path className="steam steam-b" d="M110 116 q-5 -9 0 -18 q5 -9 0 -18" />
+            <path className="steam steam-c" d="M128 116 q-5 -8 0 -16 q5 -8 0 -16" />
+          </g>
+          {/* stirring spoon (rotates around the rim) */}
+          <g className="stir">
+            <line x1="110" y1="116" x2="142" y2="86" stroke="#7a4a22" strokeWidth="5" strokeLinecap="round" />
+            <circle cx="143" cy="85" r="6" fill="#f3d7b0" stroke="#2b2622" strokeWidth="2.5" />
+          </g>
+          {/* pot, in front */}
+          <path d="M64 118 L156 118 L150 150 Q149 157 142 157 L78 157 Q71 157 70 150 Z" fill="#2b2622" />
+          <ellipse cx="110" cy="118" rx="48" ry="9" fill="#3a322b" stroke="#2b2622" strokeWidth="2" />
+          <ellipse className="sauce" cx="110" cy="117" rx="39" ry="6" fill="#c8643f" />
+          <path d="M62 124 q-9 2 -9 10" fill="none" stroke="#2b2622" strokeWidth="3.5" strokeLinecap="round" />
+          <path d="M158 124 q9 2 9 10" fill="none" stroke="#2b2622" strokeWidth="3.5" strokeLinecap="round" />
+        </g>
+      </svg>
+      <div className="chef-cap">{caption}</div>
     </div>
   );
 }
@@ -761,6 +999,8 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
   const hasContrib = ings.some((i) => i.contributes);
   const canEdit = Boolean(onApplyEdits) && ings.some((i) => i.per100g) && r.target_calories != null;
   const status = r.status || "untried";
+  const estimatedIngs = ings.filter((i) => i.estimated);
+  const hasEstimates = estimatedIngs.length > 0;
 
   function addTag() {
     const t = tagInput.trim().toLowerCase();
@@ -782,6 +1022,7 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
             <span className={`pill status-${status}`}>{statusLabel(status)}</span>
           )}
           {r.on_target === false && <span className="pill warn">macros off</span>}
+          {hasEstimates && <span className="pill warn">estimated</span>}
           <span className={`pill ${r.palatability_passed ? "ok" : "warn"}`}>
             {r.palatability_passed ? "taste ✓" : "needs a look"}
           </span>
@@ -789,6 +1030,11 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
       </div>
       {r.on_target === false && r.off_target_note && (
         <div className="note" style={{ color: "#9c3d2e" }}>Macros off target: {r.off_target_note}</div>
+      )}
+      {hasEstimates && (
+        <div className="note" style={{ color: "#8a5a14" }}>
+          Estimated (not USDA): {estimatedIngs.map((i) => i.name).join(", ")}. These macros are approximate.
+        </div>
       )}
 
       <div className="macros">
@@ -806,7 +1052,9 @@ function RecipeCard({ r, onKeep, keepLabel, onSetStatus, onSetTags, onDelete, on
       {ings.map((i, n) => (
         <div className="ing" key={n}>
           <span>{i.grams_cooked}g {i.name}</span>
-          <span className="src">{i.fdcDescription} · FDC {i.fdcId}</span>
+          <span className="src">
+            {i.estimated ? "estimated · not in USDA" : `${i.fdcDescription} · FDC ${i.fdcId}`}
+          </span>
         </div>
       ))}
 
